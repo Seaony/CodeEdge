@@ -490,6 +490,78 @@ struct AntigravityUsageTests {
         ])
     }
 
+    @Test
+    func summaryDropsRedundantDescriptionWhenResetTimeExists() throws {
+        let data = Data("""
+        {
+          "groups": [{
+            "displayName": "Gemini Models",
+            "buckets": [
+              {
+                "bucketId": "gemini-5h",
+                "displayName": "Five Hour Limit",
+                "description": "You have used some of your 5-hour limit, it will fully refresh in 4 hours.",
+                "remainingFraction": 0.9,
+                "resetTime": "2026-11-22T08:30:07Z"
+              },
+              {
+                "bucketId": "gemini-weekly",
+                "displayName": "Weekly Limit",
+                "description": "Resets in 6 days",
+                "remainingFraction": 0.95
+              }
+            ]
+          }]
+        }
+        """.utf8)
+
+        let rows = try AntigravityUsageFetcher.parseQuotaSummary(data: data).additionalWindows
+
+        #expect(rows[0].resetsAt != nil)
+        #expect(rows[0].detail == nil)
+        #expect(rows[1].resetsAt == nil)
+        #expect(rows[1].detail == "Resets in 6 days")
+    }
+
+    @Test
+    func visibleSummaryWindowsHidesIdleFamiliesAndKeepsAllWhenEverythingIsIdle() {
+        let reset = Date(timeIntervalSince1970: 1_800_000_000)
+        let mixed = [
+            UsageWindow(id: "antigravity-quota-summary-gemini-5h", label: "Gemini 5-hour", usedFraction: 0.11, resetsAt: reset, detail: "stale detail"),
+            UsageWindow(id: "antigravity-quota-summary-gemini-weekly", label: "Gemini weekly", usedFraction: 0.03, resetsAt: reset, detail: "stale detail"),
+            UsageWindow(id: "antigravity-quota-summary-gemini-argon-wtu-weekly", label: "Gemini 4 Argon weekly", usedFraction: 0, resetsAt: reset, detail: nil),
+            UsageWindow(id: "antigravity-quota-summary-3p-5h", label: "Claude/\(Self.otherAbbreviation) 5-hour", usedFraction: 0, resetsAt: reset, detail: nil),
+            UsageWindow(id: "antigravity-quota-summary-3p-weekly", label: "Claude/\(Self.otherAbbreviation) weekly", usedFraction: 0, resetsAt: reset, detail: nil),
+        ]
+
+        let visible = AntigravityUsageFetcher.visibleSummaryWindows(from: mixed)
+
+        #expect(visible.map(\.id) == [
+            "antigravity-quota-summary-gemini-5h",
+            "antigravity-quota-summary-gemini-weekly",
+        ])
+        #expect(visible.allSatisfy { $0.detail == nil })
+
+        let allIdle = mixed.map { window in
+            UsageWindow(id: window.id, label: window.label, usedFraction: 0, resetsAt: window.resetsAt, detail: nil)
+        }
+        #expect(AntigravityUsageFetcher.visibleSummaryWindows(from: allIdle).map(\.id) == mixed.map(\.id))
+
+        var withArgon = mixed
+        withArgon[2] = UsageWindow(
+            id: "antigravity-quota-summary-gemini-argon-wtu-weekly",
+            label: "Gemini 4 Argon weekly",
+            usedFraction: 0.05,
+            resetsAt: reset,
+            detail: nil
+        )
+        #expect(AntigravityUsageFetcher.visibleSummaryWindows(from: withArgon).map(\.id) == [
+            "antigravity-quota-summary-gemini-5h",
+            "antigravity-quota-summary-gemini-weekly",
+            "antigravity-quota-summary-gemini-argon-wtu-weekly",
+        ])
+    }
+
     private func stubSession(_ protocolClass: AnyClass) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [protocolClass]

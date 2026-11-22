@@ -163,7 +163,7 @@ struct ProviderDetailCard: View {
 
     private var displayedWindows: [UsageWindow] {
         if descriptor.id.rawValue == "antigravity", !usage.additionalWindows.isEmpty {
-            return usage.additionalWindows
+            return AntigravityUsageFetcher.visibleSummaryWindows(from: usage.additionalWindows)
         }
         return usage.windows + usage.additionalWindows
     }

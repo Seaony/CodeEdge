@@ -418,7 +418,9 @@ nonisolated enum AntigravityUsageFetcher {
                 let disabled = bool(bucket["disabled"]) ?? false
                 guard !disabled, let remaining else { continue }
                 let fraction = min(max(1 - remaining, 0), 1)
-                let detail = clean(bucket["description"] as? String)
+                let resetsAt = parseDate(bucket["resetTime"])
+                // 已有明确重置时间时，接口 description 只会重复英文倒计时文案；仅在缺少 resetTime 时保留。
+                let detail = resetsAt == nil ? clean(bucket["description"] as? String) : nil
                 windows.append((
                     family.rank,
                     cadence.rank,
@@ -428,7 +430,7 @@ nonisolated enum AntigravityUsageFetcher {
                         id: "antigravity-quota-summary-\(bucketID)",
                         label: "\(groupName) \(cadence.title ?? rawName)",
                         usedFraction: fraction,
-                        resetsAt: parseDate(bucket["resetTime"]),
+                        resetsAt: resetsAt,
                         detail: detail,
                         windowMinutes: cadence.rank == 0 ? 300 : cadence.rank == 1 ? 10080 : nil
                     )
@@ -917,6 +919,49 @@ nonisolated enum AntigravityUsageFetcher {
     private static let ordinaryGeminiWindowIDs = Set(
         ["session", "5h", "5-hour", "five hour", "five-hour", "weekly"].map { "antigravity-quota-summary-gemini-\($0)" }
     )
+
+    // 对齐 CodexBar：至少有一个家族产生用量时，隐藏全条均为 0% 已用的空闲家族；
+    // 全部为 0% 时保留全部通道避免卡片空白。带版本号的独立额度（如 Gemini 4 Argon）按独立分组判定。
+    static func visibleSummaryWindows(from windows: [UsageWindow]) -> [UsageWindow] {
+        let prefix = "antigravity-quota-summary-"
+        let summary = windows.filter { $0.id.hasPrefix(prefix) }
+        guard !summary.isEmpty else { return windows }
+        let families = Dictionary(grouping: summary, by: displayFamilyKey)
+        let idleFamilies = families.filter { _, lanes in
+            lanes.allSatisfy { $0.clampedFraction <= 0 }
+        }
+        let idleIDs: Set<String> = idleFamilies.count < families.count
+            ? Set(idleFamilies.values.flatMap { $0.map(\.id) })
+            : []
+        return windows.compactMap { window in
+            guard !idleIDs.contains(window.id) else { return nil }
+            guard window.id.hasPrefix(prefix), window.resetsAt != nil, window.detail != nil else {
+                return window
+            }
+            var sanitized = window
+            sanitized.detail = nil
+            return sanitized
+        }
+    }
+
+    private static func displayFamilyKey(_ window: UsageWindow) -> String {
+        var id = window.id.lowercased().replacingOccurrences(of: "_", with: "-")
+        if id.hasSuffix(" limit") { id.removeLast(" limit".count) }
+        if ordinaryGeminiWindowIDs.contains(id) { return "gemini" }
+        if id.contains("3p") || id.contains("third-party") { return "other" }
+        let label = window.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        for suffix in [" 5-hour", " weekly"] where label.hasSuffix(suffix) {
+            let stripped = String(label.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
+            if !stripped.isEmpty {
+                if stripped == "gemini" { return "gemini" }
+                if stripped.contains("claude") || stripped.contains(otherFamilyAbbreviation.lowercased()) {
+                    return "other"
+                }
+                return stripped
+            }
+        }
+        return label
+    }
 
     private static func quotaCadence(
         bucketID: String, displayName: String, window: String?
