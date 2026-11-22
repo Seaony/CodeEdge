@@ -127,12 +127,7 @@ actor UsageCollector: UsageCollecting {
         if claudeUsesAdminAPI {
             return usage
         }
-        guard descriptor.id.rawValue == "codex"
-            || descriptor.id.rawValue == "claude"
-            || descriptor.id.rawValue == "vertexai"
-            || descriptor.id.rawValue == "deepseek"
-            || descriptor.id.rawValue == "pi"
-        else {
+        guard Self.supportsLocalMetadata(for: descriptor) else {
             return usage
         }
         return await enrichLocalMetadata(
@@ -147,12 +142,7 @@ actor UsageCollector: UsageCollecting {
         descriptor: ProviderDescriptor,
         allowVertexClaudeFallback: Bool = false
     ) async -> ProviderUsage {
-        guard descriptor.id.rawValue == "codex"
-            || descriptor.id.rawValue == "claude"
-            || descriptor.id.rawValue == "vertexai"
-            || descriptor.id.rawValue == "deepseek"
-            || descriptor.id.rawValue == "pi"
-        else {
+        guard Self.supportsLocalMetadata(for: descriptor) else {
             return usage
         }
         let catalog = await resolvedPricingCatalog()
@@ -162,6 +152,15 @@ actor UsageCollector: UsageCollecting {
             pricingCatalog: catalog,
             allowVertexClaudeFallback: allowVertexClaudeFallback
         )
+    }
+
+    private nonisolated static func supportsLocalMetadata(for descriptor: ProviderDescriptor) -> Bool {
+        switch descriptor.id.rawValue {
+        case "codex", "claude", "vertexai", "deepseek", "pi", "antigravity":
+            return true
+        default:
+            return false
+        }
     }
 
     private func collectRaw(
@@ -1592,6 +1591,19 @@ actor UsageCollector: UsageCollecting {
                $0.id == "claude-weekly" || $0.id == "claude-seven_day"
            }) {
             return weekly
+        }
+        if descriptor.id.rawValue == "antigravity" {
+            let weeklySummary = usage.additionalWindows.filter {
+                $0.id.hasPrefix("antigravity-quota-summary-") && $0.windowMinutes == 10_080
+            }
+            if let mostConstrained = weeklySummary.max(by: { lhs, rhs in
+                if lhs.clampedFraction != rhs.clampedFraction {
+                    return lhs.clampedFraction < rhs.clampedFraction
+                }
+                return lhs.id > rhs.id
+            }) {
+                return mostConstrained
+            }
         }
         let secondary = descriptor.secondaryLabel.lowercased()
         return usage.windows.first { $0.label.lowercased() == secondary }

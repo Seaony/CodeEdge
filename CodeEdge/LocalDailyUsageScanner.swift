@@ -721,6 +721,8 @@ actor LocalDailyUsageScanner {
     private var vertexFileStates: [String: ClaudeFileState] = [:]
     // Pi 会话文件按大小和修改时间缓存解析结果，没变的文件不重复读取。
     private var piFileCache: [String: (size: UInt64, modified: Int64, usage: PiSessionFileUsage)] = [:]
+    // Antigravity 会话库按主文件与 -wal 的大小和修改时间缓存解析结果。
+    private var antigravityFileCache: [String: (fingerprint: AntigravityDatabaseFingerprint, entries: [AntigravityLocalUsageEntry])] = [:]
     private var activeVertexCacheProvider: String?
     private var loadedProviders: Set<String> = []
     private let cacheDirectory: URL?
@@ -818,6 +820,8 @@ actor LocalDailyUsageScanner {
             )
         case "pi":
             scanPi(periods: &periods, homeDirectory: homeDirectory, pricingCatalog: pricingCatalog)
+        case "antigravity":
+            scanAntigravity(periods: &periods, homeDirectory: homeDirectory, pricingCatalog: pricingCatalog)
         default:
             return nil
         }
@@ -2316,6 +2320,83 @@ actor LocalDailyUsageScanner {
         default:
             return nil
         }
+    }
+
+    private func scanAntigravity(
+        periods: inout PeriodAccumulators,
+        homeDirectory: URL,
+        pricingCatalog: ModelPricingCatalog?
+    ) {
+        let roots = AntigravityLocalUsageReader.databaseRoots(
+            homeDirectory: homeDirectory,
+            environment: ProcessInfo.processInfo.environment
+        )
+        let databases = AntigravityLocalUsageReader.discoverDatabases(roots: roots)
+        var allEntries: [AntigravityLocalUsageEntry] = []
+        var livePaths = Set<String>()
+        for url in databases {
+            let path = url.path
+            guard let fingerprint = AntigravityLocalUsageReader.fingerprint(of: url) else { continue }
+            guard fingerprint.latestModifiedDate >= periods.last30DaysStart else { continue }
+            livePaths.insert(path)
+            if let cached = antigravityFileCache[path], cached.fingerprint == fingerprint {
+                allEntries.append(contentsOf: cached.entries)
+                continue
+            }
+            if let parsed = AntigravityLocalUsageReader.readDatabase(at: url) {
+                antigravityFileCache[path] = (fingerprint, parsed)
+                allEntries.append(contentsOf: parsed)
+            } else if let cached = antigravityFileCache[path] {
+                allEntries.append(contentsOf: cached.entries)
+            }
+        }
+        antigravityFileCache = antigravityFileCache.filter { livePaths.contains($0.key) }
+        for entry in AntigravityLocalUsageReader.deduplicated(allEntries) {
+            periods.add(
+                timestamp: entry.timestamp,
+                tokens: entry.totalTokens,
+                valueUSD: Self.antigravityCost(entry, catalog: pricingCatalog),
+                model: entry.model,
+                counts: Tokens(
+                    input: entry.inputTokens,
+                    cacheRead: entry.cacheReadTokens,
+                    cacheWrite: entry.cacheWriteTokens,
+                    output: entry.billedOutputTokens
+                ),
+                inputIncludesCache: false
+            )
+        }
+    }
+
+    private static func antigravityCost(
+        _ entry: AntigravityLocalUsageEntry,
+        catalog: ModelPricingCatalog?
+    ) -> Double? {
+        if entry.totalTokens == 0, entry.model == "unknown" { return 0 }
+        let sample = ClaudeSample(
+            timestamp: entry.timestamp,
+            model: entry.model,
+            tokens: Tokens(
+                input: entry.inputTokens,
+                cacheRead: entry.cacheReadTokens,
+                cacheWrite: entry.cacheWriteTokens,
+                output: entry.billedOutputTokens
+            ),
+            cacheWrite1h: 0,
+            isSidechain: false
+        )
+        if let rates = claudeRates(for: entry.model, at: entry.timestamp, catalog: catalog) {
+            return claudeCost(sample: sample, rates: rates)
+        }
+        if let base = AntigravityLocalUsageReader.pricingBaseModelID(for: entry.model),
+           let rates = claudeRates(for: base, at: entry.timestamp, catalog: catalog) {
+            return claudeCost(sample: sample, rates: rates)
+        }
+        if let explicit = AntigravityLocalUsageReader.explicitCatalogEntries[entry.model.lowercased()],
+           let rates = catalog?.rates(providerID: explicit.providerID, modelID: explicit.modelID) {
+            return claudeCost(sample: sample, rates: rates)
+        }
+        return nil
     }
 
     private static func deepSeekHarnessCost(
