@@ -148,8 +148,8 @@ nonisolated enum AntigravityUsageFetcher {
         var plan: String?
     }
 
-    private struct LocalProcess: Sendable {
-        enum Kind: Int, Sendable {
+    struct LocalProcess: Equatable, Sendable {
+        enum Kind: Int, Equatable, Sendable {
             case app = 0
             case command = 1
             case ide = 2
@@ -157,15 +157,24 @@ nonisolated enum AntigravityUsageFetcher {
 
         var pid: Int32
         var csrfToken: String
-        var extensionPort: Int?
-        var extensionToken: String?
+        var httpsPort: Int? = nil
+        var httpPort: Int? = nil
+        var extensionPort: Int? = nil
+        var extensionToken: String? = nil
         var kind: Kind
     }
 
-    private struct LocalEndpoint: Hashable, Sendable {
+    struct LocalEndpoint: Hashable, Sendable {
         var scheme: String
         var port: Int
         var token: String
+    }
+
+    private struct DaemonDiscovery: Sendable {
+        var pid: Int32
+        var csrfToken: String
+        var httpsPort: Int?
+        var httpPort: Int?
     }
 
     private static let baseURL = "https://cloudcode-pa.googleapis.com"
@@ -198,7 +207,11 @@ nonisolated enum AntigravityUsageFetcher {
     ) async throws -> ProviderUsage {
         if source != .token {
             do {
-                let local = try await fetchLocal(environment: environment, now: now)
+                let local = try await fetchLocal(
+                    environment: environment,
+                    homeDirectory: homeDirectory,
+                    now: now
+                )
                 if let expected = try? resolvedCredentials(
                     rawCredential: rawCredential,
                     environment: environment,
@@ -594,8 +607,12 @@ nonisolated enum AntigravityUsageFetcher {
         return credentials
     }
 
-    private static func fetchLocal(environment: [String: String], now: Date) async throws -> ProviderUsage {
-        let processes = try localProcesses()
+    private static func fetchLocal(
+        environment: [String: String],
+        homeDirectory: URL,
+        now: Date
+    ) async throws -> ProviderUsage {
+        let processes = try localProcesses(homeDirectory: homeDirectory)
         var lastError: Error = AntigravityUsageError.localServiceUnavailable
         for kind in [LocalProcess.Kind.app, .command] {
             for process in processes.filter({ $0.kind == kind }) {
@@ -630,9 +647,17 @@ nonisolated enum AntigravityUsageFetcher {
         throw lastError
     }
 
-    private static func fetchLocal(process: LocalProcess, now: Date) async throws -> ProviderUsage {
-        let ports = try listeningPorts(pid: process.pid)
-        var endpoints = ports.map { LocalEndpoint(scheme: "https", port: $0, token: process.csrfToken) }
+    static func localEndpoints(for process: LocalProcess, listeningPorts: [Int]) -> [LocalEndpoint] {
+        var endpoints: [LocalEndpoint] = []
+        if let httpsPort = process.httpsPort {
+            endpoints.append(LocalEndpoint(scheme: "https", port: httpsPort, token: process.csrfToken))
+        }
+        if let httpPort = process.httpPort {
+            endpoints.append(LocalEndpoint(scheme: "http", port: httpPort, token: process.csrfToken))
+        }
+        endpoints.append(contentsOf: listeningPorts.map {
+            LocalEndpoint(scheme: "https", port: $0, token: process.csrfToken)
+        })
         if let port = process.extensionPort {
             endpoints.append(LocalEndpoint(
                 scheme: "http",
@@ -640,6 +665,37 @@ nonisolated enum AntigravityUsageFetcher {
                 token: clean(process.extensionToken) ?? process.csrfToken
             ))
         }
+        return unique(endpoints)
+    }
+
+    private static func fetchLocal(process: LocalProcess, now: Date) async throws -> ProviderUsage {
+        var lastError: Error = AntigravityUsageError.localServiceUnavailable
+        var attempted = Set<LocalEndpoint>()
+        if process.httpsPort != nil || process.httpPort != nil {
+            let directEndpoints = localEndpoints(for: process, listeningPorts: [])
+            do {
+                return try await fetchLocal(endpoints: directEndpoints, now: now)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+                attempted.formUnion(directEndpoints)
+            }
+        }
+        let ports: [Int]
+        if attempted.isEmpty {
+            ports = try listeningPorts(pid: process.pid)
+        } else {
+            ports = (try? listeningPorts(pid: process.pid)) ?? []
+        }
+        let fallbackEndpoints = localEndpoints(for: process, listeningPorts: ports).filter {
+            !attempted.contains($0)
+        }
+        guard !fallbackEndpoints.isEmpty else { throw lastError }
+        return try await fetchLocal(endpoints: fallbackEndpoints, now: now)
+    }
+
+    private static func fetchLocal(endpoints: [LocalEndpoint], now: Date) async throws -> ProviderUsage {
         var lastError: Error = AntigravityUsageError.localServiceUnavailable
         for endpoint in unique(endpoints) {
             do {
@@ -1226,8 +1282,15 @@ nonisolated enum AntigravityUsageFetcher {
         throw lastError
     }
 
-    private static func localProcesses() throws -> [LocalProcess] {
+    private static func localProcesses(homeDirectory: URL) throws -> [LocalProcess] {
         let output = try run("/bin/ps", arguments: ["-ax", "-o", "pid=,command="])
+        return try parseLocalProcesses(output: output, homeDirectory: homeDirectory)
+    }
+
+    static func parseLocalProcesses(
+        output: String,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) throws -> [LocalProcess] {
         var processes: [LocalProcess] = []
         var missingToken = false
         for line in output.split(whereSeparator: \.isNewline) {
@@ -1236,7 +1299,13 @@ nonisolated enum AntigravityUsageFetcher {
                   let pid = Int32(text[..<split]) else { continue }
             let command = String(text[split...]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard let kind = processKind(command) else { continue }
-            let token = flag("--csrf_token", in: command) ?? ""
+            let commandToken = flag("--csrf_token", in: command) ?? ""
+            // Antigravity 2.34+ 桌面端 language_server 以 standalone 运行，不再通过命令行传 --csrf_token，
+            // 而是把 pid、端口和 csrfToken 写到 ~/.gemini/<app_data_dir>/daemon/*.json。
+            let discovery = commandToken.isEmpty
+                ? daemonDiscovery(forPID: pid, kind: kind, command: command, homeDirectory: homeDirectory)
+                : nil
+            let token = commandToken.isEmpty ? (discovery?.csrfToken ?? "") : commandToken
             if kind != .command, token.isEmpty {
                 missingToken = true
                 continue
@@ -1244,6 +1313,8 @@ nonisolated enum AntigravityUsageFetcher {
             processes.append(LocalProcess(
                 pid: pid,
                 csrfToken: token,
+                httpsPort: discovery?.httpsPort,
+                httpPort: discovery?.httpPort,
                 extensionPort: flag("--extension_server_port", in: command).flatMap(Int.init),
                 extensionToken: flag("--extension_server_csrf_token", in: command),
                 kind: kind
@@ -1251,6 +1322,70 @@ nonisolated enum AntigravityUsageFetcher {
         }
         if processes.isEmpty, missingToken { throw AntigravityUsageError.localServiceUnavailable }
         return processes
+    }
+
+    private static func daemonDiscovery(
+        forPID pid: Int32,
+        kind: LocalProcess.Kind,
+        command: String,
+        homeDirectory: URL
+    ) -> DaemonDiscovery? {
+        var directoryNames: [String] = []
+        if let appDataDir = flag("--app_data_dir", in: command),
+           !appDataDir.contains("/"), !appDataDir.contains("\\"),
+           appDataDir != ".", appDataDir != ".." {
+            directoryNames.append(appDataDir)
+        }
+        switch kind {
+        case .app: directoryNames.append("antigravity")
+        case .ide: directoryNames.append("antigravity-ide")
+        case .command: directoryNames.append("antigravity-cli")
+        }
+        let manager = FileManager.default
+        for directoryName in unique(directoryNames) {
+            let directory = homeDirectory.appending(path: ".gemini/\(directoryName)/daemon")
+            guard let entries = try? manager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            let candidates = entries
+                .filter { $0.pathExtension.lowercased() == "json" }
+                .sorted { lhs, rhs in
+                    let left = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    let right = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    return left > right
+                }
+            for file in candidates {
+                let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                guard size > 0, size <= 65_536,
+                      let data = try? Data(contentsOf: file),
+                      let root = try? object(data),
+                      let entryPID = integer(root["pid"]), Int32(entryPID) == pid,
+                      let token = clean(root["csrfToken"] as? String) ?? clean(root["csrf_token"] as? String)
+                else { continue }
+                return DaemonDiscovery(
+                    pid: pid,
+                    csrfToken: token,
+                    httpsPort: validPort(root["httpsPort"] ?? root["https_port"]),
+                    httpPort: validPort(root["httpPort"] ?? root["http_port"])
+                )
+            }
+        }
+        return nil
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let value = value as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() {
+            return value.intValue
+        }
+        if let value = value as? String { return Int(value) }
+        return nil
+    }
+
+    private static func validPort(_ value: Any?) -> Int? {
+        guard let port = integer(value), (1...65_535).contains(port) else { return nil }
+        return port
     }
 
     private static func processKind(_ command: String) -> LocalProcess.Kind? {

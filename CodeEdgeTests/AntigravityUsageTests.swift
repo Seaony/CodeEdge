@@ -403,6 +403,93 @@ struct AntigravityUsageTests {
         #expect(usage.plan == expectedPlan)
     }
 
+    @Test
+    func standaloneDesktopProcessReadsTokenAndPortsFromMatchingDaemonFile() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appending(path: "codeedge-ag-daemon-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let daemonDir = home.appending(path: ".gemini/antigravity/daemon", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: daemonDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        try Data("""
+        {"pid":1111,"httpsPort":50001,"httpPort":50002,"csrfToken":"stale-token"}
+        """.utf8).write(to: daemonDir.appending(path: "hub_50002.json"))
+        try Data("""
+        {"pid":8812,"httpsPort":60695,"httpPort":60696,"lsVersion":"2.34.0","csrfToken":"live-token"}
+        """.utf8).write(to: daemonDir.appending(path: "hub_60696.json"))
+
+        let psOutput = """
+         8812 /Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone --override_ide_name antigravity --app_data_dir antigravity --https_server_port 0
+        """
+
+        let processes = try AntigravityUsageFetcher.parseLocalProcesses(output: psOutput, homeDirectory: home)
+
+        #expect(processes == [
+            AntigravityUsageFetcher.LocalProcess(
+                pid: 8812,
+                csrfToken: "live-token",
+                httpsPort: 60695,
+                httpPort: 60696,
+                extensionPort: nil,
+                extensionToken: nil,
+                kind: .app
+            ),
+        ])
+
+        let endpoints = AntigravityUsageFetcher.localEndpoints(for: processes[0], listeningPorts: [60695, 60913])
+        #expect(endpoints == [
+            AntigravityUsageFetcher.LocalEndpoint(scheme: "https", port: 60695, token: "live-token"),
+            AntigravityUsageFetcher.LocalEndpoint(scheme: "http", port: 60696, token: "live-token"),
+            AntigravityUsageFetcher.LocalEndpoint(scheme: "https", port: 60913, token: "live-token"),
+        ])
+    }
+
+    @Test
+    func standaloneDesktopProcessWithoutMatchingDaemonFileFailsAsUnavailable() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appending(path: "codeedge-ag-missing-daemon-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let daemonDir = home.appending(path: ".gemini/antigravity/daemon", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: daemonDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        try Data("""
+        {"pid":9999,"httpsPort":60695,"httpPort":60696,"csrfToken":"other-pid-token"}
+        """.utf8).write(to: daemonDir.appending(path: "hub_60696.json"))
+
+        let psOutput = """
+         8812 /Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone --app_data_dir antigravity
+        """
+
+        #expect(throws: AntigravityUsageError.localServiceUnavailable) {
+            _ = try AntigravityUsageFetcher.parseLocalProcesses(output: psOutput, homeDirectory: home)
+        }
+    }
+
+    @Test
+    func legacyProcessKeepsCommandLineCSRFTokenOverDaemonDiscovery() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appending(path: "codeedge-ag-legacy-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let psOutput = """
+         4242 /Applications/Antigravity.app/Contents/Resources/bin/language_server --app_data_dir antigravity --csrf_token cli-token --extension_server_port 51234 --extension_server_csrf_token ext-token
+        """
+
+        let processes = try AntigravityUsageFetcher.parseLocalProcesses(output: psOutput, homeDirectory: home)
+
+        #expect(processes == [
+            AntigravityUsageFetcher.LocalProcess(
+                pid: 4242,
+                csrfToken: "cli-token",
+                httpsPort: nil,
+                httpPort: nil,
+                extensionPort: 51234,
+                extensionToken: "ext-token",
+                kind: .app
+            ),
+        ])
+    }
+
     private func stubSession(_ protocolClass: AnyClass) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [protocolClass]
