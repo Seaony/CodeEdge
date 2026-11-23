@@ -148,6 +148,75 @@ struct AntigravityLocalUsageTests {
         #expect(weekly?.usedFraction == 0.04)
     }
 
+    @Test
+    func scansT3CodeAntigravityACPConversations() async throws {
+        let home = FileManager.default.temporaryDirectory
+            .appending(path: "codeedge-ag-t3-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let t3Conversations = home.appending(
+            path: ".t3/userdata/providers/antigravity/account-hash-1/antigravity-acp/conversations",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: t3Conversations, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let now = Date(timeIntervalSince1970: 1_795_320_000)
+        let turnTime = UInt64(now.addingTimeInterval(-120).timeIntervalSince1970)
+        try createConversationDB(
+            at: t3Conversations.appending(path: "t3-session.db"),
+            generations: [
+                (
+                    idx: 0,
+                    blob: makeGenMetadataBlob(
+                        model: "gemini-4-neon",
+                        label: nil,
+                        newInput: 100_000,
+                        cacheRead: 200_000,
+                        output: 10_000,
+                        reasoning: 10_000,
+                        responseID: "t3-resp-1",
+                        botID: "t3-bot-1",
+                        stepUUID: "t3-step-1",
+                        embeddedTimestampSec: nil
+                    )
+                ),
+            ],
+            steps: [
+                (idx: 0, blob: makeStepMetadataBlob(timestampSec: turnTime, stepUUID: "t3-step-1", botID: "t3-bot-1")),
+            ]
+        )
+
+        let catalog = try JSONDecoder().decode(
+            ModelPricingCatalog.self,
+            from: Data("""
+            {
+              "google": {
+                "models": {
+                  "gemini-4-neon": {
+                    "id": "gemini-4-neon",
+                    "cost": {"input": 3, "cache_read": 0.15, "output": 15}
+                  }
+                }
+              }
+            }
+            """.utf8)
+        )
+
+        let scanner = LocalDailyUsageScanner()
+        let summary = await scanner.scan(
+            providerID: ProviderID(rawValue: "antigravity"),
+            currentWeekStart: now.addingTimeInterval(-3600),
+            now: now,
+            homeDirectory: home,
+            pricingCatalog: catalog
+        )
+
+        let resolved = try #require(summary)
+        #expect(resolved.today?.tokens == 320_000)
+        let cost = try #require(resolved.today?.valueUSD)
+        // 0.1*3 + 0.2*0.15 + 0.02*15 = 0.30 + 0.03 + 0.30 = 0.63
+        #expect(abs(cost - 0.63) < 0.000_001)
+    }
+
     // MARK: - SQLite & Protobuf Fixtures
 
     private func createForeignDB(at url: URL) throws {

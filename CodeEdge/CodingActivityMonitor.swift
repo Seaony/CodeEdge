@@ -20,6 +20,10 @@ final class CodingActivityMonitor {
         self.roots = roots ?? (
             LocalDailyUsageScanner.claudeProjectRoots(homeDirectory: home)
                 + LocalDailyUsageScanner.codexSessionRoots(homeDirectory: home)
+                + AntigravityLocalUsageReader.databaseRoots(
+                    homeDirectory: home,
+                    environment: ProcessInfo.processInfo.environment
+                )
         )
         self.latency = latency
         self.onActivity = onActivity

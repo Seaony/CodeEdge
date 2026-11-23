@@ -156,7 +156,7 @@ actor UsageCollector: UsageCollecting {
 
     private nonisolated static func supportsLocalMetadata(for descriptor: ProviderDescriptor) -> Bool {
         switch descriptor.id.rawValue {
-        case "codex", "claude", "vertexai", "deepseek", "pi", "antigravity":
+        case "codex", "claude", "vertexai", "deepseek", "zai", "pi", "antigravity":
             return true
         default:
             return false

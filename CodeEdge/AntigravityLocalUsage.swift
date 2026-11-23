@@ -69,15 +69,53 @@ nonisolated enum AntigravityLocalUsageReader {
         } else {
             geminiHome = homeDirectory.appending(path: ".gemini", directoryHint: .isDirectory)
         }
-        let candidates = [
+        var candidates = [
             geminiHome.appending(path: "antigravity-cli/conversations", directoryHint: .isDirectory),
+            geminiHome.appending(path: "antigravity-acp/conversations", directoryHint: .isDirectory),
             geminiHome.appending(path: "antigravity", directoryHint: .isDirectory),
             geminiHome.appending(path: "antigravity/conversations", directoryHint: .isDirectory),
         ]
+        candidates.append(contentsOf: t3DatabaseRoots(homeDirectory: homeDirectory))
         var seen = Set<String>()
         return candidates.filter {
             seen.insert($0.standardizedFileURL.resolvingSymlinksInPath().path).inserted
         }
+    }
+
+    private static func t3DatabaseRoots(homeDirectory: URL) -> [URL] {
+        let manager = FileManager.default
+        let providersRoot = homeDirectory.appending(
+            path: ".t3/userdata/providers/antigravity",
+            directoryHint: .isDirectory
+        )
+        var profileHomes: [URL] = []
+        if let items = try? manager.contentsOfDirectory(
+            at: providersRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for item in items.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                guard (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+                    continue
+                }
+                profileHomes.append(item)
+            }
+        }
+        profileHomes.append(
+            contentsOf: LocalDailyUsageScanner.t3ProviderHomePaths(
+                drivers: ["antigravity"],
+                homeDirectory: homeDirectory
+            )
+        )
+        var roots: [URL] = []
+        for profileHome in profileHomes {
+            roots.append(profileHome.appending(path: "antigravity-acp/conversations", directoryHint: .isDirectory))
+            roots.append(profileHome.appending(path: "antigravity-cli/conversations", directoryHint: .isDirectory))
+            roots.append(profileHome.appending(path: "antigravity/conversations", directoryHint: .isDirectory))
+            roots.append(profileHome.appending(path: "antigravity", directoryHint: .isDirectory))
+            roots.append(profileHome.appending(path: "conversations", directoryHint: .isDirectory))
+        }
+        return roots
     }
 
     static func discoverDatabases(roots: [URL]) -> [URL] {

@@ -432,6 +432,100 @@ struct LocalDailyUsageScannerTests {
         #expect(turns["priced"]?.model == "gpt-5.4")
     }
 
+    @Test
+    func scansZaiGLMFromT3CodeCustomClaudeHomeWithoutLeakingIntoClaude() async throws {
+        let home = try temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now = Date()
+
+        let t3Userdata = home.appending(path: ".t3/userdata", directoryHint: .isDirectory)
+        let glmProjects = home.appending(path: ".claude_glm/projects/sample", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: t3Userdata, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: glmProjects, withIntermediateDirectories: true)
+
+        let t3Settings: [String: Any] = [
+            "providerInstances": [
+                "claudeAgent_glm": [
+                    "driver": "claudeAgent",
+                    "displayName": "GLM",
+                    "config": ["homePath": "~/.claude_glm"],
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: t3Settings)
+            .write(to: t3Userdata.appending(path: "settings.json"))
+
+        try writeLines(
+            [claudeEntry(model: "claude-sonnet-4-6", input: 1_000, output: 100, now: now)],
+            to: home.appending(path: ".claude/projects/sample/claude.jsonl")
+        )
+        try writeLines(
+            [
+                [
+                    "type": "assistant",
+                    "timestamp": ISO8601DateFormatter().string(from: now.addingTimeInterval(-60)),
+                    "requestId": "request-glm-1",
+                    "message": [
+                        "id": "message-glm-1",
+                        "model": "glm-5.3",
+                        "usage": ["input_tokens": 100_000, "output_tokens": 10_000],
+                    ],
+                ],
+                [
+                    "type": "assistant",
+                    "timestamp": ISO8601DateFormatter().string(from: now.addingTimeInterval(-30)),
+                    "requestId": "request-glm-2",
+                    "message": [
+                        "id": "message-glm-2",
+                        "model": "glm-5.4",
+                        "usage": ["input_tokens": 200_000, "output_tokens": 20_000],
+                    ],
+                ],
+            ],
+            to: glmProjects.appending(path: "glm.jsonl")
+        )
+
+        let catalog = try JSONDecoder().decode(
+            ModelPricingCatalog.self,
+            from: Data("""
+            {
+              "zai": {
+                "models": {
+                  "glm-5.3": {
+                    "id": "glm-5.3",
+                    "cost": {"input": 1.4, "cache_read": 0.26, "output": 4.4}
+                  }
+                }
+              }
+            }
+            """.utf8)
+        )
+
+        let scanner = LocalDailyUsageScanner(cacheDirectory: home.appending(path: "cache"))
+        let claude = await scanner.scan(
+            providerID: ProviderID(rawValue: "claude"),
+            currentWeekStart: now.addingTimeInterval(-7 * 24 * 60 * 60),
+            now: now,
+            homeDirectory: home,
+            pricingCatalog: catalog
+        )
+        let zai = await scanner.scan(
+            providerID: ProviderID(rawValue: "zai"),
+            currentWeekStart: now.addingTimeInterval(-7 * 24 * 60 * 60),
+            now: now,
+            homeDirectory: home,
+            pricingCatalog: catalog
+        )
+
+        #expect(claude?.today?.tokens == 1_100)
+        #expect(zai?.today?.tokens == 330_000)
+        #expect(zai?.today?.valueUSD == nil)
+        // glm-5.3 已计价部分: 0.1*1.4 + 0.01*4.4 = 0.14 + 0.044 = 0.184
+        let partial = try #require(zai?.today?.partialValueUSD)
+        #expect(abs(partial - 0.184) < 1e-10)
+        #expect(Set(zai?.todayByModel?.map(\.model) ?? []) == ["glm-5.3", "glm-5.4"])
+    }
+
     private func writePricedSession(model: String, input: Int, now: Date, home: URL) throws {
         try writeLines([
             ["type": "session_meta", "payload": ["id": "priced"]],

@@ -776,7 +776,7 @@ actor LocalDailyUsageScanner {
                 periods: &periods,
                 homeDirectory: homeDirectory,
                 pricingCatalog: pricingCatalog,
-                modelFilter: { !Self.isDeepSeekModel($0) }
+                modelFilter: { !Self.isDeepSeekModel($0) && !Self.isZaiModel($0) }
             )
         case "claude":
             scanClaude(
@@ -785,7 +785,7 @@ actor LocalDailyUsageScanner {
                 pricingCatalog: pricingCatalog,
                 cacheProvider: cacheProvider,
                 filter: .excludeVertex,
-                modelFilter: { !Self.isDeepSeekModel($0) }
+                modelFilter: { !Self.isDeepSeekModel($0) && !Self.isZaiModel($0) }
             )
         case "vertexai":
             scanClaude(
@@ -794,7 +794,7 @@ actor LocalDailyUsageScanner {
                 pricingCatalog: pricingCatalog,
                 cacheProvider: cacheProvider,
                 filter: allowVertexClaudeFallback ? .all : .vertexOnly,
-                modelFilter: { !Self.isDeepSeekModel($0) }
+                modelFilter: { !Self.isDeepSeekModel($0) && !Self.isZaiModel($0) }
             )
         case "deepseek":
             loadCachedStatesIfNeeded(provider: "codex")
@@ -817,6 +817,23 @@ actor LocalDailyUsageScanner {
                 cacheProvider: "claude-filtered",
                 filter: .excludeVertex,
                 modelFilter: Self.isDeepSeekModel
+            )
+        case "zai":
+            loadCachedStatesIfNeeded(provider: "codex")
+            loadCachedStatesIfNeeded(provider: "claude-filtered")
+            scanCodex(
+                periods: &periods,
+                homeDirectory: homeDirectory,
+                pricingCatalog: pricingCatalog,
+                modelFilter: Self.isZaiModel
+            )
+            scanClaude(
+                periods: &periods,
+                homeDirectory: homeDirectory,
+                pricingCatalog: pricingCatalog,
+                cacheProvider: "claude-filtered",
+                filter: .excludeVertex,
+                modelFilter: Self.isZaiModel
             )
         case "pi":
             scanPi(periods: &periods, homeDirectory: homeDirectory, pricingCatalog: pricingCatalog)
@@ -1357,11 +1374,24 @@ actor LocalDailyUsageScanner {
     }
 
     static func codexSessionRoots(homeDirectory: URL) -> [URL] {
+        let environment = ProcessInfo.processInfo.environment
+        let configured = environment["CODEX_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         let codexHome = codexHomeDirectory(homeDirectory: homeDirectory)
-        return [
+        var roots = [
             codexHome.appending(path: "sessions", directoryHint: .isDirectory),
             codexHome.appending(path: "archived_sessions", directoryHint: .isDirectory),
         ]
+        if configured?.isEmpty != false {
+            for customHome in t3ProviderHomePaths(drivers: ["codex"], homeDirectory: homeDirectory) {
+                roots.append(customHome.appending(path: "sessions", directoryHint: .isDirectory))
+                roots.append(customHome.appending(path: "archived_sessions", directoryHint: .isDirectory))
+            }
+        }
+        var seen: Set<String> = []
+        return roots.compactMap {
+            let standardized = $0.standardizedFileURL
+            return seen.insert(standardized.path).inserted ? standardized : nil
+        }
     }
 
     static func claudeProjectRoots(homeDirectory: URL) -> [URL] {
@@ -1379,11 +1409,65 @@ actor LocalDailyUsageScanner {
             homeDirectory.appending(path: ".claude/projects", directoryHint: .isDirectory),
         ]
         roots.append(contentsOf: claudeDesktopProjectRoots(homeDirectory: homeDirectory))
+        roots.append(
+            contentsOf: t3ProviderHomePaths(drivers: ["claudeAgent", "claude"], homeDirectory: homeDirectory)
+                .map { $0.appending(path: "projects", directoryHint: .isDirectory) }
+        )
         var seen: Set<String> = []
         return roots.compactMap {
             let standardized = $0.standardizedFileURL
             return seen.insert(standardized.path).inserted ? standardized : nil
         }
+    }
+
+    private struct T3Settings: Decodable {
+        struct ProviderInstance: Decodable {
+            struct Config: Decodable {
+                let homePath: String?
+            }
+
+            let driver: String?
+            let config: Config?
+        }
+
+        let providerInstances: [String: ProviderInstance]?
+    }
+
+    /// 读取 T3 Code 设置里为指定 driver 配置的自定义 homePath（例如 claudeAgent 的 `~/.claude_glm`）。
+    static func t3ProviderHomePaths(drivers: Set<String>, homeDirectory: URL) -> [URL] {
+        let normalizedDrivers = Set(drivers.map { $0.lowercased() })
+        let settingsURL = homeDirectory.appending(path: ".t3/userdata/settings.json")
+        guard let data = try? Data(contentsOf: settingsURL),
+              let settings = try? JSONDecoder().decode(T3Settings.self, from: data),
+              let instances = settings.providerInstances
+        else { return [] }
+
+        var seen: Set<String> = []
+        var result: [URL] = []
+        for key in instances.keys.sorted() {
+            guard let instance = instances[key],
+                  let driver = instance.driver?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  normalizedDrivers.contains(driver),
+                  let rawHome = instance.config?.homePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !rawHome.isEmpty,
+                  !rawHome.contains("\0")
+            else { continue }
+            let expanded: URL
+            if rawHome == "~" {
+                expanded = homeDirectory
+            } else if rawHome.hasPrefix("~/") {
+                expanded = homeDirectory.appending(path: String(rawHome.dropFirst(2)), directoryHint: .isDirectory)
+            } else if rawHome.hasPrefix("/") {
+                expanded = URL(fileURLWithPath: rawHome, isDirectory: true)
+            } else {
+                continue
+            }
+            let standardized = expanded.standardizedFileURL
+            if seen.insert(standardized.path).inserted {
+                result.append(standardized)
+            }
+        }
+        return result
     }
 
     private static func claudeDesktopProjectRoots(homeDirectory: URL) -> [URL] {
@@ -2184,7 +2268,7 @@ actor LocalDailyUsageScanner {
             let model = String(trimmed[trimmed.index(after: slash)...])
             let supportedProviders: Set<String> = [
                 "deepseek", "kimi-coding", "kimi-for-coding", "openai",
-                "opencode", "opencode-free", "opencode-go",
+                "opencode", "opencode-free", "opencode-go", "zai", "zhipuai",
             ]
             guard supportedProviders.contains(provider) else { return nil }
             return catalog.rates(providerID: provider, modelID: model)
@@ -2197,6 +2281,16 @@ actor LocalDailyUsageScanner {
                 ?? (provider == "opencode-free"
                     ? catalog.rates(providerID: "opencode", modelID: model)
                     : nil)
+                ?? (provider == "zai"
+                    ? catalog.rates(providerID: "zhipuai", modelID: model)
+                    : nil)
+                ?? (provider == "zhipuai"
+                    ? catalog.rates(providerID: "zai", modelID: model)
+                    : nil)
+        }
+        if trimmed == "glm" || trimmed.hasPrefix("glm-") {
+            return catalog.rates(providerID: "zai", modelID: trimmed)
+                ?? catalog.rates(providerID: "zhipuai", modelID: trimmed)
         }
         return catalog.rates(providerID: "openai", modelID: trimmed)
             ?? catalog.rates(providerID: "openai", modelID: normalizedCodexModel(trimmed))
@@ -2210,6 +2304,21 @@ actor LocalDailyUsageScanner {
             return String(model[..<slash]) == "deepseek"
         }
         return model == "deepseek" || model.hasPrefix("deepseek-")
+    }
+
+    private static func isZaiModel(_ rawModel: String?) -> Bool {
+        guard let rawModel else { return false }
+        let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !model.isEmpty else { return false }
+        if let slash = model.firstIndex(of: "/") {
+            let provider = String(model[..<slash])
+            let name = String(model[model.index(after: slash)...])
+            if ["zai", "zhipuai", "zhipu", "bigmodel", "zai-org"].contains(provider) {
+                return true
+            }
+            return name == "glm" || name.hasPrefix("glm-")
+        }
+        return model == "glm" || model.hasPrefix("glm-")
     }
 
     private func scanDeepSeekHarness(
@@ -2421,12 +2530,18 @@ actor LocalDailyUsageScanner {
             let model = String(trimmed[trimmed.index(after: slash)...])
             let supportedProviders: Set<String> = [
                 "anthropic", "openai", "google", "moonshot", "kimi-for-coding",
-                "minimax", "deepseek",
+                "minimax", "deepseek", "zai", "zhipuai",
             ]
             guard supportedProviders.contains(provider) else { return nil }
             return catalog.rates(providerID: provider, modelID: model)
                 ?? (provider == "kimi-for-coding" && model == "k3[1m]"
                     ? catalog.rates(providerID: provider, modelID: "k3")
+                    : nil)
+                ?? (provider == "zai"
+                    ? catalog.rates(providerID: "zhipuai", modelID: model)
+                    : nil)
+                ?? (provider == "zhipuai"
+                    ? catalog.rates(providerID: "zai", modelID: model)
                     : nil)
         }
         let model = normalizedClaudeModel(trimmed)
@@ -2446,11 +2561,13 @@ actor LocalDailyUsageScanner {
             preferredProviders = ["minimax"]
         } else if model.hasPrefix("deepseek-") {
             preferredProviders = ["deepseek"]
+        } else if model == "glm" || model.hasPrefix("glm-") {
+            preferredProviders = ["zai", "zhipuai"]
         } else {
             preferredProviders = nil
         }
         var matches: [ModelTokenRates] = []
-        for provider in preferredProviders ?? ["anthropic", "openai", "google", "moonshot", "kimi-for-coding", "minimax", "deepseek"] {
+        for provider in preferredProviders ?? ["anthropic", "openai", "google", "moonshot", "kimi-for-coding", "minimax", "deepseek", "zai", "zhipuai"] {
             if let rates = catalog.rates(providerID: provider, modelID: model)
                 ?? (provider == "kimi-for-coding" && model == "k3[1m]"
                     ? catalog.rates(providerID: provider, modelID: "k3")
