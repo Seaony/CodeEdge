@@ -504,7 +504,7 @@
 			repositoryURL = "https://github.com/steipete/SweetCookieKit";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 0.5.11;
+				minimumVersion = 0.6.0;
 			};
 		};
 		A40F30AA3045000100000001 /* XCRemoteSwiftPackageReference "ColorSelector" */ = {

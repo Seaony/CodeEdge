@@ -44,8 +44,33 @@ actor LocalDailyUsageScanner {
         let turnID: String?
         let responseID: String?
         let priority: Bool?
+        let ultrafast: Bool?
         // 恢复 turn 时切回标准档后的请求，日志库里同一 turn 的 Fast 记录不能把它改成 Fast。
         var confirmedStandard: Bool?
+
+        init(
+            sequence: Int,
+            timestamp: Date,
+            model: String?,
+            tokens: Tokens,
+            eventKey: CodexEventKey?,
+            turnID: String?,
+            responseID: String?,
+            priority: Bool?,
+            ultrafast: Bool? = nil,
+            confirmedStandard: Bool?
+        ) {
+            self.sequence = sequence
+            self.timestamp = timestamp
+            self.model = model
+            self.tokens = tokens
+            self.eventKey = eventKey
+            self.turnID = turnID
+            self.responseID = responseID
+            self.priority = priority
+            self.ultrafast = ultrafast
+            self.confirmedStandard = confirmedStandard
+        }
     }
 
     private struct CodexMirrorKey: Codable, Hashable {
@@ -539,7 +564,7 @@ actor LocalDailyUsageScanner {
     }
 
     private struct CodexFileState: Codable {
-        static let currentParserVersion = 3
+        static let currentParserVersion = 4
 
         var parserVersion = currentParserVersion
         var size: UInt64 = 0
@@ -557,7 +582,9 @@ actor LocalDailyUsageScanner {
         var currentTurnID: String?
         var startedTurnID: String?
         var threadPriority: Bool?
+        var threadUltrafast: Bool?
         var turnPriorities: [String: Bool] = [:]
+        var turnUltrafasts: [String: Bool] = [:]
         var resumedStandardTurns: Set<String> = []
         var turnModels: [String: String] = [:]
         var nextSequence = 0
@@ -587,6 +614,7 @@ actor LocalDailyUsageScanner {
                 sequence: sequence, timestamp: timestamp, model: model, tokens: tokens,
                 eventKey: eventKey, turnID: turnID, responseID: responseID,
                 priority: turnPriorities[turnID ?? ""],
+                ultrafast: turnUltrafasts[turnID ?? ""] == true ? true : nil,
                 confirmedStandard: resumedStandardTurns.contains(turnID ?? "") ? true : nil
             ))
             return sequence
@@ -972,14 +1000,17 @@ actor LocalDailyUsageScanner {
                         // 恢复同一个 turn 时不会再有 task_started，按当前线程档位刷新，之前的请求不受影响。
                         if let priority = state.threadPriority,
                            state.startedTurnID == nil || state.startedTurnID == turnID {
-                            if priority != (state.turnPriorities[turnID] == true) {
-                                if priority {
+                            let ultrafast = state.threadUltrafast == true
+                            if priority != (state.turnPriorities[turnID] == true)
+                                || ultrafast != (state.turnUltrafasts[turnID] == true) {
+                                if priority || ultrafast {
                                     state.resumedStandardTurns.remove(turnID)
                                 } else {
                                     state.resumedStandardTurns.insert(turnID)
                                 }
                             }
                             state.turnPriorities[turnID] = priority
+                            state.turnUltrafasts[turnID] = ultrafast ? true : nil
                         }
                     }
                     if let turnID = state.currentTurnID, let model = state.currentModel {
@@ -989,7 +1020,9 @@ actor LocalDailyUsageScanner {
                 }
                 if line.type == "event_msg", let payload = line.payload,
                    payload.type == "thread_settings_applied" {
-                    state.threadPriority = payload.threadSettings?.serviceTier == "priority"
+                    let tier = payload.threadSettings?.serviceTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    state.threadPriority = tier == "priority"
+                    state.threadUltrafast = tier == "ultrafast" ? true : nil
                     return
                 }
                 if line.type == "event_msg", let payload = line.payload,
@@ -997,7 +1030,9 @@ actor LocalDailyUsageScanner {
                     state.clearPendingMirrors()
                     state.currentTurnID = payload.turnID ?? payload.turnId ?? payload.id
                     state.startedTurnID = state.currentTurnID
-                    state.turnPriorities[state.currentTurnID ?? ""] = state.threadPriority
+                    let turnKey = state.currentTurnID ?? ""
+                    state.turnPriorities[turnKey] = state.threadPriority
+                    state.turnUltrafasts[turnKey] = state.threadUltrafast == true ? true : nil
                     return
                 }
                 guard let payload = line.payload, let timestamp = date(line.timestamp)
@@ -1065,14 +1100,25 @@ actor LocalDailyUsageScanner {
                 let isIncludedAutoReview = state.hasCreatorAccount
                     && sample.timestamp >= Self.codexAutoReviewFreeCutoff
                     && sample.model.map { Self.normalizedCodexModel($0.lowercased()) } == "codex-auto-review"
-                let valueUSD = isIncludedAutoReview ? 0 : rates.map { rates -> Double in
-                    let base = Self.codexCost(tokens: sample.tokens, rates: rates)
-                    guard (priorityTurn != nil && sample.confirmedStandard != true) || sample.priority == true,
-                          let multiplier = pricedModel.flatMap({
-                              Self.codexFastMultiplier(for: $0, inputTokens: sample.tokens.input)
-                          })
-                    else { return base }
-                    return base * multiplier
+                let valueUSD: Double? = if isIncludedAutoReview {
+                    0
+                } else if sample.ultrafast == true {
+                    rates.flatMap { rates in
+                        guard let multiplier = pricedModel.flatMap({
+                            Self.codexUltrafastMultiplier(for: $0, at: sample.timestamp)
+                        }) else { return nil }
+                        return Self.codexCost(tokens: sample.tokens, rates: rates) * multiplier
+                    }
+                } else {
+                    rates.map { rates -> Double in
+                        let base = Self.codexCost(tokens: sample.tokens, rates: rates)
+                        guard (priorityTurn != nil && sample.confirmedStandard != true) || sample.priority == true,
+                              let multiplier = pricedModel.flatMap({
+                                  Self.codexFastMultiplier(for: $0, inputTokens: sample.tokens.input)
+                              })
+                        else { return base }
+                        return base * multiplier
+                    }
                 }
                 periods.add(
                     timestamp: sample.timestamp,
@@ -1991,11 +2037,14 @@ actor LocalDailyUsageScanner {
     }
 
     private static let codexFastInputTokenLimit = 272_000
+    // 2027-03-01 00:00:00 America/Los_Angeles (UTC-8)
+    private static let codexUltrafastPromoCutoff: TimeInterval = 1_803_888_000
 
     private static func codexPricedModel(
         sample: CodexSample,
         priorityTurn: CodexPriorityTurn?
     ) -> String? {
+        guard sample.ultrafast != true else { return sample.model }
         guard let priorityTurn,
               let model = priorityTurn.model,
               codexFastMultiplier(for: model) != nil
@@ -2006,13 +2055,29 @@ actor LocalDailyUsageScanner {
     private static func codexFastMultiplier(for model: String, inputTokens: Int = 0) -> Double? {
         let model = normalizedCodexModel(model.lowercased())
         if inputTokens > codexFastInputTokenLimit,
-           model != "gpt-6-astra", model != "gpt-6.1-sol" {
+           !codexFastAllowsLongContext(model: model) {
             return nil
         }
         return switch model {
-        case "gpt-6-astra", "gpt-6.1-sol": 2
+        case "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-6.2-astra", "gpt-6.2-sol": 2
         case "gpt-5.4", "gpt-5.4-mini", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna": 2
         case "gpt-5.5": 2.5
+        default: nil
+        }
+    }
+
+    private static func codexFastAllowsLongContext(model: String) -> Bool {
+        switch model {
+        case "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-6.2-astra", "gpt-6.2-sol": true
+        default: false
+        }
+    }
+
+    private static func codexUltrafastMultiplier(for model: String, at date: Date) -> Double? {
+        switch normalizedCodexModel(model.lowercased()) {
+        case "gpt-6-astra", "gpt-6.1-sol": 6
+        case "gpt-6.2-astra", "gpt-6.2-sol":
+            date.timeIntervalSince1970 < codexUltrafastPromoCutoff ? 3 : 6
         default: nil
         }
     }
@@ -2112,12 +2177,33 @@ actor LocalDailyUsageScanner {
 
     private static func codexBundledRates(for model: String) -> ModelTokenRates? {
         return switch model {
+        case "gpt-6.2-astra":
+            ModelTokenRates(
+                input: 8e-6, cacheRead: 4e-7, cacheWrite: 1e-5, output: 4e-5,
+                threshold: 272_000, inputAboveThreshold: 1.6e-5,
+                cacheReadAboveThreshold: 8e-7, cacheWriteAboveThreshold: 2e-5,
+                outputAboveThreshold: 6e-5
+            )
+        case "gpt-6.2-sol":
+            ModelTokenRates(
+                input: 2e-6, cacheRead: 1e-7, cacheWrite: 2.5e-6, output: 1e-5,
+                threshold: 272_000, inputAboveThreshold: 4e-6,
+                cacheReadAboveThreshold: 2e-7, cacheWriteAboveThreshold: 5e-6,
+                outputAboveThreshold: 1.5e-5
+            )
         case "gpt-6.1-sol":
             ModelTokenRates(
                 input: 2e-6, cacheRead: 1e-7, cacheWrite: 2.5e-6, output: 1e-5,
                 threshold: 272_000, inputAboveThreshold: 4e-6,
                 cacheReadAboveThreshold: 2e-7, cacheWriteAboveThreshold: 5e-6,
                 outputAboveThreshold: 1.5e-5
+            )
+        case "gpt-6.1-terra":
+            ModelTokenRates(
+                input: 1e-6, cacheRead: 5e-8, cacheWrite: 1.25e-6, output: 5e-6,
+                threshold: 272_000, inputAboveThreshold: 2e-6,
+                cacheReadAboveThreshold: 1e-7, cacheWriteAboveThreshold: 2.5e-6,
+                outputAboveThreshold: 7.5e-6
             )
         case "gpt-6-sol":
             ModelTokenRates(
@@ -2236,6 +2322,9 @@ actor LocalDailyUsageScanner {
         }
         if model == "claude-mythos-5-1" {
             return ModelTokenRates(input: 1e-5, cacheRead: 2.5e-7, cacheWrite: 1.25e-5, output: 5e-5, threshold: nil, inputAboveThreshold: nil, cacheReadAboveThreshold: nil, cacheWriteAboveThreshold: nil, outputAboveThreshold: nil)
+        }
+        if model == "claude-mythos-5-2" {
+            return ModelTokenRates(input: 8e-6, cacheRead: 2e-7, cacheWrite: 1e-5, output: 4e-5, threshold: nil, inputAboveThreshold: nil, cacheReadAboveThreshold: nil, cacheWriteAboveThreshold: nil, outputAboveThreshold: nil)
         }
         if model == "claude-haiku-4-5" {
             return ModelTokenRates(input: 1e-6, cacheRead: 1e-7, cacheWrite: 1.25e-6, output: 5e-6, threshold: nil, inputAboveThreshold: nil, cacheReadAboveThreshold: nil, cacheWriteAboveThreshold: nil, outputAboveThreshold: nil)

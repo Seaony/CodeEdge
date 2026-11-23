@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 nonisolated enum CursorUsageError: LocalizedError, Equatable {
@@ -14,6 +15,7 @@ nonisolated enum CursorUsageError: LocalizedError, Equatable {
 enum CursorUsageFetcher {
     static func fetch(
         credential: String,
+        allowLocalSpendFallback: Bool = false,
         session: URLSession,
         now: Date = Date()
     ) async throws -> ProviderUsage {
@@ -71,7 +73,7 @@ enum CursorUsageFetcher {
         }
         let legacy = requestUsageData.flatMap { try? JSONDecoder().decode(CursorLegacyUsage.self, from: $0) }
         try Task.checkCancellation()
-        return try parse(
+        var usage = try parse(
             summaryData: summary,
             user: user,
             legacy: legacy,
@@ -80,6 +82,14 @@ enum CursorUsageFetcher {
             unified: unified,
             now: now
         )
+        // 本地 Tokscale 缓存不含账号身份，只能在自动模式下作为本地用量补充，不能覆盖手动凭据。
+        if allowLocalSpendFallback,
+           case let .report(report) = CursorLocalJSONReader.load(now: now) {
+            if usage.today == nil { usage.today = report.today }
+            if usage.last30Days == nil { usage.last30Days = report.last30Days }
+            if usage.last30DaysDaily.isEmpty { usage.last30DaysDaily = report.last30DaysDaily }
+        }
+        return usage
     }
 
     static func parse(
@@ -559,5 +569,388 @@ private struct CursorSummary: Decodable {
     var isTeamPlan: Bool {
         ["enterprise", "business", "team", "teams"].contains(membershipType?.lowercased() ?? "")
             || limitType?.lowercased() == "team"
+    }
+}
+
+/// 读取 Tokscale 生成的 Cursor JSON 缓存（`~/.config/tokscale/cursor-cache/usage.json`）。
+/// 一旦存在 canonical `usage.json`，即作为权威来源，不再混用旧 CSV。
+nonisolated enum CursorLocalJSONReader {
+    enum Result: Equatable {
+        case absent
+        case unavailable
+        case report(Report)
+    }
+
+    struct Report: Equatable {
+        let today: DailyTokenUsage?
+        let last30Days: DailyTokenUsage?
+        let last30DaysDaily: [DailyTokenUsagePoint]
+        let meteredCostUSD: Double?
+        let isComplete: Bool
+    }
+
+    static func cacheDirectory(
+        home: URL? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        if let home {
+            return home.appendingPathComponent(".config/tokscale/cursor-cache", isDirectory: true)
+        }
+        if let dir = environment["TOKSCALE_CONFIG_DIR"], !dir.isEmpty {
+            return URL(fileURLWithPath: dir).appendingPathComponent("cursor-cache", isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/tokscale/cursor-cache", isDirectory: true)
+    }
+
+    static func load(
+        home: URL? = nil,
+        now: Date = Date(),
+        historyDays: Int = 30,
+        calendar: Calendar = .current,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Result {
+        let url = cacheDirectory(home: home, environment: environment).appendingPathComponent("usage.json")
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else { return .unavailable }
+        } catch {
+            let nsError = error as NSError
+            return nsError.domain == NSCocoaErrorDomain
+                && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(nsError.code)
+                ? .absent : .unavailable
+        }
+        guard let data = try? Data(contentsOf: url),
+              let document = try? JSONDecoder().decode(Document.self, from: data) else {
+            return .unavailable
+        }
+        let rows = document.rows.compactMap(\.value)
+        let isComplete = rows.count == document.rows.count
+        let todayStart = calendar.startOfDay(for: now)
+        guard let end = calendar.date(byAdding: .day, value: 1, to: todayStart),
+              let since = calendar.date(byAdding: .day, value: -(max(1, historyDays) - 1), to: todayStart) else {
+            return .unavailable
+        }
+
+        let deduped = deduplicated(rows).filter { row in
+            let date = Date(timeIntervalSince1970: Double(row.timestampMS) / 1000)
+            return date >= since && date <= end
+        }
+        guard !deduped.isEmpty else {
+            return .report(Report(
+                today: nil,
+                last30Days: nil,
+                last30DaysDaily: [],
+                meteredCostUSD: nil,
+                isComplete: isComplete
+            ))
+        }
+
+        var dayTotals: [Date: (tokens: Int64, costUSD: Double, hasCost: Bool, missingCost: Bool)] = [:]
+        var totalTokens: Int64 = 0
+        var totalCostUSD: Double = 0
+        var hasAnyCost = false
+        var hasMissingCost = false
+
+        for row in deduped {
+            let date = Date(timeIntervalSince1970: Double(row.timestampMS) / 1000)
+            let day = calendar.startOfDay(for: date)
+            let tokens = row.totalTokens
+            totalTokens += tokens
+            var bucket = dayTotals[day] ?? (0, 0, false, false)
+            bucket.tokens += tokens
+            if let cents = row.costCents {
+                let usd = cents / 100
+                totalCostUSD += usd
+                hasAnyCost = true
+                bucket.costUSD += usd
+                bucket.hasCost = true
+            } else {
+                hasMissingCost = true
+                bucket.missingCost = true
+            }
+            dayTotals[day] = bucket
+        }
+
+        let dailyPoints = dayTotals.keys.sorted().map { day -> DailyTokenUsagePoint in
+            let bucket = dayTotals[day]!
+            let usage = DailyTokenUsage(
+                tokens: bucket.tokens,
+                valueUSD: bucket.hasCost && !bucket.missingCost ? bucket.costUSD : nil,
+                partialValueUSD: bucket.hasCost && bucket.missingCost ? bucket.costUSD : nil
+            )
+            return DailyTokenUsagePoint(date: day, usage: usage)
+        }
+        let todayBucket = dayTotals[todayStart]
+        let todayUsage = todayBucket.map { bucket in
+            DailyTokenUsage(
+                tokens: bucket.tokens,
+                valueUSD: bucket.hasCost && !bucket.missingCost ? bucket.costUSD : nil,
+                partialValueUSD: bucket.hasCost && bucket.missingCost ? bucket.costUSD : nil
+            )
+        }
+        let last30Usage = DailyTokenUsage(
+            tokens: totalTokens,
+            valueUSD: hasAnyCost && !hasMissingCost ? totalCostUSD : nil,
+            partialValueUSD: hasAnyCost && hasMissingCost ? totalCostUSD : nil
+        )
+        return .report(Report(
+            today: todayUsage,
+            last30Days: last30Usage,
+            last30DaysDaily: dailyPoints,
+            meteredCostUSD: isComplete && hasAnyCost && !hasMissingCost ? totalCostUSD : nil,
+            isComplete: isComplete
+        ))
+    }
+
+    private static func deduplicated(_ rows: [Row]) -> [Row] {
+        var identified: [Row.Identity: String] = [:]
+        for row in rows {
+            guard let id = row.id else { continue }
+            identified[row.identity] = min(identified[row.identity] ?? id, id)
+        }
+        var winners: [String: Int] = [:]
+        var keep = Array(repeating: true, count: rows.count)
+        for (index, row) in rows.enumerated() {
+            guard let id = row.id ?? identified[row.identity] else { continue }
+            if let previous = winners[id] {
+                let old = rows[previous]
+                if row.totalTokens > old.totalTokens
+                    || (row.totalTokens == old.totalTokens && row.rankCost > old.rankCost) {
+                    keep[previous] = false
+                    winners[id] = index
+                } else {
+                    keep[index] = false
+                }
+            } else {
+                winners[id] = index
+            }
+        }
+        return rows.enumerated().compactMap { keep[$0.offset] ? $0.element : nil }
+    }
+
+    private enum InvalidCache: Error {
+        case metadata
+        case row
+    }
+
+    private struct Document: Decodable {
+        let rows: [LossyRow]
+
+        enum CodingKeys: String, CodingKey {
+            case rows = "usageEventsDisplay"
+            case owner = "_owner"
+            case legacy = "_tokscale"
+            case footer = "zzTokscaleOwner"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let hasEnvelope = container.contains(.owner) || container.contains(.footer)
+            if container.contains(.legacy) || hasEnvelope {
+                let legacy = try container.decode(LegacyOwner.self, forKey: .legacy)
+                guard legacy.version == 1, !legacy.accountId.isEmpty else { throw InvalidCache.metadata }
+                if hasEnvelope {
+                    let owner = try container.decode(Owner.self, forKey: .owner)
+                    let footer = try container.decode(Footer.self, forKey: .footer)
+                    let hash = SHA256.hash(data: Data(legacy.accountId.utf8))
+                        .map { String(format: "%02x", $0) }.joined()
+                    guard owner.version == 1, footer.version == 1,
+                          UUID(uuidString: owner.generation) != nil,
+                          owner.generation == footer.generation,
+                          owner.ownerHash == hash else {
+                        throw InvalidCache.metadata
+                    }
+                }
+            }
+            rows = try container.decode([LossyRow].self, forKey: .rows)
+        }
+    }
+
+    private struct Owner: Decodable {
+        let version: Int
+        let ownerHash: String
+        let generation: String
+    }
+
+    private struct Footer: Decodable {
+        let version: Int
+        let generation: String
+    }
+
+    private struct LegacyOwner: Decodable {
+        let version: Int
+        let accountId: String
+    }
+
+    private struct LossyRow: Decodable {
+        let value: Row?
+
+        init(from decoder: Decoder) {
+            value = try? Row(from: decoder)
+        }
+    }
+
+    private struct Row: Decodable {
+        struct Identity: Hashable {
+            let conversation: String?
+            let model: String
+            let timestamp: Int64
+        }
+
+        let id: String?
+        let identity: Identity
+        let timestampMS: Int64
+        let model: String
+        let totalTokens: Int64
+        let costCents: Double?
+
+        var rankCost: Double { costCents ?? 0 }
+
+        enum CodingKeys: String, CodingKey {
+            case usageEventId, conversationId, timestamp, model, chargedCents, tokenUsage
+        }
+
+        init(from decoder: Decoder) throws {
+            let conversation: String?
+            let timestamp: Timestamp?
+            let model: String?
+            let charged: Amount?
+            let usage: Tokens?
+            if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+                id = Self.nonempty(try? container.decode(String.self, forKey: .usageEventId))
+                conversation = Self.nonempty(try? container.decode(String.self, forKey: .conversationId))
+                timestamp = try container.decodeIfPresent(Timestamp.self, forKey: .timestamp)
+                model = Self.nonempty(try? container.decode(String.self, forKey: .model))
+                charged = try container.decodeIfPresent(Amount.self, forKey: .chargedCents)
+                usage = try container.decodeIfPresent(Tokens.self, forKey: .tokenUsage)
+            } else {
+                var container = try decoder.unkeyedContainer()
+                id = nil
+                conversation = try Self.nonempty(container.decodeIfPresent(String.self))
+                timestamp = container.isAtEnd ? nil : try container.decodeIfPresent(Timestamp.self)
+                model = try Self.nonempty(container.isAtEnd ? nil : container.decodeIfPresent(String.self))
+                charged = container.isAtEnd ? nil : try container.decodeIfPresent(Amount.self)
+                usage = container.isAtEnd ? nil : try container.decodeIfPresent(Tokens.self)
+                guard container.isAtEnd else { throw InvalidCache.row }
+            }
+            guard let timestamp, let model else { throw InvalidCache.row }
+            self.timestampMS = timestamp.milliseconds
+            self.model = model
+            self.identity = Identity(conversation: conversation, model: model, timestamp: timestamp.milliseconds)
+            self.totalTokens = usage?.totalTokens ?? 0
+            self.costCents = usage?.totalCents ?? charged?.value
+        }
+
+        private static func nonempty(_ value: String?) -> String? {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+            return value
+        }
+    }
+
+    private struct Timestamp: Decodable {
+        let milliseconds: Int64
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            let milliseconds: Int64?
+            if let value = try? container.decode(String.self) {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let numeric = Int64(trimmed) ?? Double(trimmed).flatMap(Int64.init(exactly:)) {
+                    milliseconds = numeric
+                } else {
+                    let parsed = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(trimmed))
+                        ?? (try? Date.ISO8601FormatStyle().parse(trimmed))
+                    milliseconds = parsed.flatMap {
+                        Int64(exactly: ($0.timeIntervalSince1970 * 1000).rounded(.towardZero))
+                    }
+                }
+            } else {
+                milliseconds = (try? container.decode(Double.self)).flatMap(Int64.init(exactly:))
+            }
+            guard let milliseconds, milliseconds > 0, milliseconds <= 253_402_300_799_999 else {
+                throw InvalidCache.row
+            }
+            self.milliseconds = milliseconds
+        }
+    }
+
+    private struct Count: Decodable {
+        let value: Int64
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            let value: Int64? = if let integer = try? container.decode(Int64.self) {
+                integer
+            } else if let text = try? container.decode(String.self) {
+                Int64(text) ?? Double(text).flatMap(Int64.init(exactly:))
+            } else {
+                (try? container.decode(Double.self)).flatMap(Int64.init(exactly:))
+            }
+            guard let value, value >= 0 else { throw InvalidCache.row }
+            self.value = value
+        }
+    }
+
+    private struct Amount: Decodable {
+        let value: Double?
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if container.decodeNil() {
+                value = nil
+                return
+            }
+            let parsed: Double? = if let text = try? container.decode(String.self) {
+                Double(text)
+            } else {
+                try? container.decode(Double.self)
+            }
+            if let parsed, parsed.isFinite, parsed >= 0 {
+                value = parsed
+            } else {
+                value = nil
+            }
+        }
+    }
+
+    private struct Tokens: Decodable {
+        let totalTokens: Int64
+        let totalCents: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalCents
+        }
+
+        init(from decoder: Decoder) throws {
+            let input: Int64
+            let output: Int64
+            let read: Int64
+            let write: Int64
+            let cost: Double?
+            if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+                input = try container.decodeIfPresent(Count.self, forKey: .inputTokens)?.value ?? 0
+                output = try container.decodeIfPresent(Count.self, forKey: .outputTokens)?.value ?? 0
+                read = try container.decodeIfPresent(Count.self, forKey: .cacheReadTokens)?.value ?? 0
+                write = try container.decodeIfPresent(Count.self, forKey: .cacheWriteTokens)?.value ?? 0
+                cost = try container.decodeIfPresent(Amount.self, forKey: .totalCents)?.value
+            } else {
+                var container = try decoder.unkeyedContainer()
+                input = container.isAtEnd ? 0 : try container.decodeIfPresent(Count.self)?.value ?? 0
+                output = container.isAtEnd ? 0 : try container.decodeIfPresent(Count.self)?.value ?? 0
+                read = container.isAtEnd ? 0 : try container.decodeIfPresent(Count.self)?.value ?? 0
+                write = container.isAtEnd ? 0 : try container.decodeIfPresent(Count.self)?.value ?? 0
+                cost = container.isAtEnd ? nil : try container.decodeIfPresent(Amount.self)?.value
+                guard container.isAtEnd else { throw InvalidCache.row }
+            }
+            var total: Int64 = 0
+            for part in [input, output, read, write] {
+                let (sum, overflow) = total.addingReportingOverflow(part)
+                guard !overflow else { throw InvalidCache.row }
+                total = sum
+            }
+            totalTokens = total
+            totalCents = cost
+        }
     }
 }

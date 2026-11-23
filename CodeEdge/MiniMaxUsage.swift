@@ -866,8 +866,9 @@ nonisolated enum MiniMaxUsageFetcher {
         let status = integer(base["status_code"] ?? base["statusCode"]) ?? 0
         guard status != 0 else { return }
         let message = string(base["status_msg"] ?? base["statusMessage"]) ?? "status_code \(status)"
-        let lower = message.lowercased()
-        if status == 1004 || lower.contains("cookie") || lower.contains("login") || lower == "invalid api key" {
+        let lower = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if status == 1004 || lower == "invalid api key" || lower.contains("cookie")
+            || lower.contains("log in") || lower.contains("login") {
             throw MiniMaxUsageError.invalidCredentials
         }
         throw MiniMaxUsageError.apiError(message)
@@ -1391,10 +1392,10 @@ nonisolated enum MiniMaxUsageFetcher {
         let patterns = [
             #"(?i)-H\s*'Cookie:\s*([^']+)'"#,
             #"(?i)-H\s*\"Cookie:\s*([^\"]+)\""#,
-            #"(?i)cookie:\s*'([^']+)'"#,
-            #"(?i)cookie:\s*\"([^\"]+)\""#,
-            #"(?i)(?:--cookie|-b)\s*'([^']+)'"#,
-            #"(?i)(?:--cookie|-b)\s*\"([^\"]+)\""#,
+            #"(?i)\bcookie:\s*'([^']+)'"#,
+            #"(?i)\bcookie:\s*\"([^\"]+)\""#,
+            #"(?i)(?:^|\s)(?:--cookie|-b)\s*'([^']+)'"#,
+            #"(?i)(?:^|\s)(?:--cookie|-b)\s*\"([^\"]+)\""#,
         ]
         for pattern in patterns {
             if let value = firstMatch(pattern, in: raw) { return value }

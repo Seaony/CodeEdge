@@ -271,7 +271,10 @@ private struct ProviderConfigurationView: View {
             : "")
         _secondarySecret = State(initialValue: providerID == "doubao" || providerID == "bedrock"
             ? readSecret("secret-access-key")
-            : providerID == "futureagi" ? readSecret("secret-key") : "")
+            : providerID == "futureagi" ? readSecret("secret-key")
+            : providerID == "vercel" ? readSecret("access-token")
+            : providerID == "siliconflow" ? readSecret("web-cookie")
+            : providerID == "openai" ? readSecret("organization-id") : "")
         let storedBedrockAuthMode = providerID == "bedrock"
             ? readSecret("aws-auth-mode")
             : ""
@@ -537,6 +540,8 @@ private struct ProviderConfigurationView: View {
                 || descriptor.id.rawValue == "v0"
                 || descriptor.id.rawValue == "gitkraken"
                 || descriptor.id.rawValue == "claudeplatform"
+                || descriptor.id.rawValue == "vercel"
+                || descriptor.id.rawValue == "mimo" && configuration.source != .cookie
                 || descriptor.id.rawValue == "helmcode" && configuration.source == .cookie
                 || descriptor.id.rawValue == "stepfun" && configuration.source != .token
                 || descriptor.id.rawValue == "claude" && configuration.source == .cookie
@@ -551,10 +556,17 @@ private struct ProviderConfigurationView: View {
                 if descriptor.id.rawValue == "siliconflow" {
                     Text(
                         copy.text(
-                            "默认中国区 https://api.siliconflow.cn（人民币）；国际账号填 https://api.siliconflow.com（美元）。留空时也会读取 SILICONFLOW_BASE_URL。",
-                            "China https://api.siliconflow.cn (CNY) is the default. International accounts use https://api.siliconflow.com (USD). When blank, SILICONFLOW_BASE_URL is also read."
+                            "默认中国区 https://api.siliconflow.cn（人民币）；国际账号填 https://api.siliconflow.com（美元）。中国区余额 API 已下线时，可将读取方式切换为 Web 并登录 cloud.siliconflow.cn。留空时也会读取 SILICONFLOW_BASE_URL。",
+                            "China https://api.siliconflow.cn (CNY) is the default. International accounts use https://api.siliconflow.com (USD). If the China balance API is retired, switch Source to Web and sign in to cloud.siliconflow.cn. When blank, SILICONFLOW_BASE_URL is also read."
                         ))
 
+                }
+                if descriptor.id.rawValue == "vercel" {
+                    Text(
+                        copy.text(
+                            "填写 Vercel Access Token 和 Team ID 时读取个人 AI Gateway 预算；留空则用 AI Gateway API Key 读取 Credits 余额。",
+                            "Provide a Vercel access token and Team ID to read your personal AI Gateway budget; leave them blank to read credits with an AI Gateway API key."
+                        ))
                 }
                 if descriptor.id.rawValue == "moonshot" {
                     Text(
@@ -627,6 +639,18 @@ private struct ProviderConfigurationView: View {
             if descriptor.id.rawValue == "futureagi" {
                 ProviderSettingsSecretField(
                     title: copy.text("Secret Key（或 FI_SECRET_KEY）", "Secret key (or FI_SECRET_KEY)"),
+                    text: $secondarySecret
+                )
+            }
+            if descriptor.id.rawValue == "vercel" {
+                ProviderSettingsSecretField(
+                    title: copy.text("Vercel Access Token（可选，用于个人预算）", "Vercel access token (optional, for personal budget)"),
+                    text: $secondarySecret
+                )
+            }
+            if descriptor.id.rawValue == "openai" {
+                ProviderSettingsTextField(
+                    title: copy.text("Organization ID（可选，仅用于旧版 Credits 余额）", "Organization ID (optional, legacy credit balance only)"),
                     text: $secondarySecret
                 )
             }
@@ -730,7 +754,15 @@ private struct ProviderConfigurationView: View {
             return "abliteration.ai API Key"
         }
         if descriptor.id.rawValue == "siliconflow" {
-            return "SiliconFlow API Key"
+            return configuration.source == .cookie
+                ? copy.text("Cookie 标头（可选，留空自动从浏览器导入）", "Cookie header (optional; blank imports from browser)")
+                : "SiliconFlow API Key"
+        }
+        if descriptor.id.rawValue == "trustedrouter" {
+            return "TrustedRouter API Key"
+        }
+        if descriptor.id.rawValue == "googledeveloper" {
+            return copy.text("Cookie 标头（me.developers.google.com，可选）", "Cookie header (me.developers.google.com, optional)")
         }
         if descriptor.id.rawValue == "tripo" {
             return "Tripo API Key"
@@ -825,7 +857,11 @@ private struct ProviderConfigurationView: View {
             return copy.text("Cookie 标头或 cURL", "Cookie header or cURL")
         }
         if descriptor.id.rawValue == "mimo" {
-            return copy.text("Cookie 标头或完整 cURL", "Cookie header or full cURL")
+            return switch configuration.source {
+            case .token: copy.text("Token Plan API Key（MIMO_API_KEY）", "Token Plan API key (MIMO_API_KEY)")
+            case .cookie: copy.text("Cookie 标头或完整 cURL", "Cookie header or full cURL")
+            default: copy.text("API Key 或 Cookie 标头（可选）", "API key or Cookie header (optional)")
+            }
         }
         if descriptor.id.rawValue == "deepinfra" {
             return "DeepInfra API Key"
@@ -971,7 +1007,23 @@ private struct ProviderConfigurationView: View {
                 : copy.text("手动 Cookie", "Manual Cookie")
         }
         if descriptor.id.rawValue == "mimo" {
-            return configuration.source == .automatic
+            return switch source {
+            case .automatic: copy.text("自动（API Key 或浏览器 Cookie）", "Auto (API key or browser cookies)")
+            case .token: "API (Token Plan)"
+            case .cookie: copy.text("手动 Cookie", "Manual Cookie")
+            default: source.title(language: language)
+            }
+        }
+        if descriptor.id.rawValue == "siliconflow" {
+            return switch source {
+            case .automatic: copy.text("自动（API Key）", "Auto (API key)")
+            case .token: "API"
+            case .cookie: copy.text("Web（中国区控制台）", "Web (China console)")
+            default: source.title(language: language)
+            }
+        }
+        if descriptor.id.rawValue == "googledeveloper" {
+            return source == .automatic
                 ? copy.text("自动导入浏览器 Cookie", "Automatic browser cookies")
                 : copy.text("手动 Cookie", "Manual Cookie")
         }
@@ -1076,7 +1128,7 @@ private struct ProviderConfigurationView: View {
                 && configuration.account == WindsurfSessionSource.manual.rawValue
         }
         if descriptor.id.rawValue == "abacus" { return configuration.source == .cookie }
-        if descriptor.id.rawValue == "mimo" { return configuration.source == .cookie }
+        if descriptor.id.rawValue == "googledeveloper" { return configuration.source == .cookie }
         if descriptor.id.rawValue == "mistral" { return configuration.source == .cookie }
         if descriptor.id.rawValue == "qoder" { return configuration.source == .cookie }
         if descriptor.id.rawValue == "longcat" { return configuration.source == .cookie }
@@ -1117,6 +1169,8 @@ private struct ProviderConfigurationView: View {
         case "v0": copy.text("项目范围（可选）", "Scope (optional)")
         case "gitkraken": copy.text("API 组织 ID（可选）", "API organization ID (optional)")
         case "claudeplatform": copy.text("Organization ID（可选）", "Organization ID (optional)")
+        case "vercel": copy.text("Team ID（配合 Access Token 使用，或 VERCEL_TEAM_ID）", "Team ID (required with access token, or VERCEL_TEAM_ID)")
+        case "mimo": copy.text("Token Plan API 区域（cn 或 sgp，默认 cn）", "Token Plan API region (cn or sgp, default cn)")
         case "helmcode":
             copy.text(
                 "Cookie 租户（nanBuilders；留空使用 Helmcode Cloud）", "Cookie tenant (nanBuilders; blank for Helmcode Cloud)")
@@ -1169,6 +1223,27 @@ private struct ProviderConfigurationView: View {
                     key: "secret-key"
                 )
             }
+            if descriptor.id.rawValue == "vercel" {
+                try store.preferences.setAuxiliarySecret(
+                    secondarySecret,
+                    for: descriptor.id,
+                    key: "access-token"
+                )
+            }
+            if descriptor.id.rawValue == "siliconflow" {
+                try store.preferences.setAuxiliarySecret(
+                    secondarySecret,
+                    for: descriptor.id,
+                    key: "web-cookie"
+                )
+            }
+            if descriptor.id.rawValue == "openai" {
+                try store.preferences.setAuxiliarySecret(
+                    secondarySecret,
+                    for: descriptor.id,
+                    key: "organization-id"
+                )
+            }
             if descriptor.id.rawValue == "bedrock" {
                 try store.preferences.setAuxiliarySecret(
                     secondarySecret,
@@ -1208,9 +1283,13 @@ private struct ProviderConfigurationView: View {
     }
 
     private var authenticationSecret: Binding<String> {
-        descriptor.id.rawValue == "stepfun" && configuration.source == .token
-            ? $stepFunManualToken
-            : $secret
+        if descriptor.id.rawValue == "stepfun", configuration.source == .token {
+            return $stepFunManualToken
+        }
+        if descriptor.id.rawValue == "siliconflow", configuration.source == .cookie {
+            return $secondarySecret
+        }
+        return $secret
     }
 
     private func stateText(_ usage: ProviderUsage) -> String {

@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 import SweetCookieKit
 
@@ -7,6 +8,7 @@ nonisolated enum NotionUsageError: LocalizedError, Equatable, Sendable {
     case invalidCredentials
     case noWorkspace
     case allowanceNotApplicable(workspace: String?)
+    case personalAllowanceUnavailable
     case apiError(String)
     case parseFailed(String)
 
@@ -42,6 +44,11 @@ nonisolated enum NotionUsageError: LocalizedError, Equatable, Sendable {
             return AppLocalization.text(
                 "Notion AI 不会追踪此工作区的用量额度。额度仅适用于 Business 和 Enterprise 工作区。",
                 "Notion AI usage allowance is not tracked for this workspace. Allowances apply to Business and Enterprise workspaces."
+            )
+        case .personalAllowanceUnavailable:
+            return AppLocalization.text(
+                "Notion 未返回此工作区可用的个人 AI 额度。请在 Notion 中查看该工作区的 AI 用量后再刷新。",
+                "Notion did not provide usable personal AI allowances for this workspace. Check AI usage for the selected workspace in Notion, then refresh again."
             )
         case let .apiError(message):
             return AppLocalization.text("Notion 接口错误：\(message)", "Notion API error: \(message)")
@@ -116,15 +123,68 @@ nonisolated struct NotionBillingPeriodWindow: Decodable, Sendable, Equatable {
     let periodEndMs: Double?
 }
 
+nonisolated struct NotionPersonalAllowanceCredits: Decodable, Sendable, Equatable {
+    let used: Double?
+    let limit: Double?
+}
+
+nonisolated struct NotionPersonalAllowance: Decodable, Sendable, Equatable {
+    let bucketId: String?
+    let cadence: String?
+    let state: String?
+    let used: Double?
+    let limit: Double?
+    let credits: NotionPersonalAllowanceCredits?
+    let periodStartMs: Double?
+    let periodEndMs: Double?
+}
+
 nonisolated struct NotionCreditRateLimitStatus: Decodable, Sendable, Equatable {
     let status: String?
     let window: NotionRollingWindow?
     let resetsInSeconds: Double?
     let billingPeriodWindow: NotionBillingPeriodWindow?
     let enforcement: String?
+    let allowances: [NotionPersonalAllowance]?
+
+    init(
+        status: String?,
+        window: NotionRollingWindow?,
+        resetsInSeconds: Double?,
+        billingPeriodWindow: NotionBillingPeriodWindow?,
+        enforcement: String?,
+        allowances: [NotionPersonalAllowance]? = nil
+    ) {
+        self.status = status
+        self.window = window
+        self.resetsInSeconds = resetsInSeconds
+        self.billingPeriodWindow = billingPeriodWindow
+        self.enforcement = enforcement
+        self.allowances = allowances
+    }
 
     var isNotApplicable: Bool {
         status?.lowercased() == "not_applicable"
+    }
+
+    var hasPersonalSchema: Bool {
+        allowances?.contains(where: { ["auto", "flex"].contains($0.bucketId ?? "") }) == true
+    }
+
+    func resolvedPersonalAllowance(bucketID: String) -> NotionPersonalAllowance? {
+        guard let allowances else { return nil }
+        let matches = allowances.filter { $0.bucketId == bucketID && $0.cadence == "billing_period" }
+        guard matches.count == 1, let entry = matches.first, entry.state == "resolved",
+              let used = entry.used, used.isFinite, used >= 0,
+              let limit = entry.limit, limit.isFinite, limit > 0,
+              (used / limit).isFinite else {
+            return nil
+        }
+        return entry
+    }
+
+    var hasResolvedPersonalAllowances: Bool {
+        resolvedPersonalAllowance(bucketID: "auto") != nil || resolvedPersonalAllowance(bucketID: "flex") != nil
     }
 }
 
@@ -132,28 +192,100 @@ nonisolated struct NotionUsageSnapshot: Sendable, Equatable {
     let rateLimit: NotionCreditRateLimitStatus
     let workspace: NotionWorkspace?
     let account: NotionAccount?
+    let workspaceCreditBalance: Double?
     let updatedAt: Date
+
+    init(
+        rateLimit: NotionCreditRateLimitStatus,
+        workspace: NotionWorkspace?,
+        account: NotionAccount?,
+        workspaceCreditBalance: Double? = nil,
+        updatedAt: Date
+    ) {
+        self.rateLimit = rateLimit
+        self.workspace = workspace
+        self.account = account
+        self.workspaceCreditBalance = workspaceCreditBalance
+        self.updatedAt = updatedAt
+    }
 
     func toProviderUsage() -> ProviderUsage {
         var windows: [UsageWindow] = []
-        if let rolling = rateLimit.window,
-           let fraction = Self.fraction(used: rolling.used, limit: rolling.limit) {
-            windows.append(UsageWindow(
-                id: "notion-rolling",
-                label: AppLocalization.text("滚动", "Rolling"),
-                usedFraction: fraction,
-                resetsAt: Self.rollingReset(from: rateLimit.resetsInSeconds, now: updatedAt),
-                detail: nil
-            ))
+        var details: [UsageDetail] = []
+
+        let standard = rateLimit.resolvedPersonalAllowance(bucketID: "auto")
+        let select = rateLimit.resolvedPersonalAllowance(bucketID: "flex")
+        if standard != nil || select != nil {
+            for (id, title, entry) in [
+                ("notion-standard", "Standard", standard),
+                ("notion-select", "Select", select),
+            ] {
+                guard let entry, let used = entry.used, let limit = entry.limit else { continue }
+                let creditUsed = entry.credits?.used
+                let creditLimit = entry.credits?.limit
+                let hasCredits = creditUsed.map { $0.isFinite && $0 >= 0 } == true
+                    && creditLimit.map { $0.isFinite && $0 > 0 } == true
+                let fraction: Double
+                if hasCredits, let cu = creditUsed, let cl = creditLimit {
+                    fraction = max(0, cu / cl)
+                    let left = max(0, cl - cu)
+                    let leftText = left.formatted(.number.precision(.fractionLength(0...2)))
+                    let usedText = cu.formatted(.number.precision(.fractionLength(0...2)))
+                    let limitText = cl.formatted(.number.precision(.fractionLength(0...2)))
+                    details.append(UsageDetail(
+                        id: "\(id)-remaining",
+                        label: AppLocalization.text("\(title) 剩余", "\(title) remaining"),
+                        value: AppLocalization.text(
+                            "\(leftText) credits（已用 \(usedText) / \(limitText)）",
+                            "\(leftText) credits (\(usedText) / \(limitText) used)"
+                        )
+                    ))
+                } else {
+                    fraction = max(0, used / limit)
+                }
+                let windowMinutes: Int? = if let start = entry.periodStartMs, let end = entry.periodEndMs,
+                                             start > 0, end > start {
+                    Int(round((end - start) / 60_000))
+                } else {
+                    nil
+                }
+                windows.append(UsageWindow(
+                    id: id,
+                    label: title,
+                    usedFraction: fraction,
+                    resetsAt: Self.date(fromMilliseconds: entry.periodEndMs),
+                    detail: nil,
+                    windowMinutes: windowMinutes
+                ))
+            }
+        } else {
+            if let rolling = rateLimit.window,
+               let fraction = Self.fraction(used: rolling.used, limit: rolling.limit) {
+                windows.append(UsageWindow(
+                    id: "notion-rolling",
+                    label: AppLocalization.text("滚动", "Rolling"),
+                    usedFraction: fraction,
+                    resetsAt: Self.rollingReset(from: rateLimit.resetsInSeconds, now: updatedAt),
+                    detail: nil
+                ))
+            }
+            if let billing = rateLimit.billingPeriodWindow,
+               let fraction = Self.fraction(used: billing.used, limit: billing.limit) {
+                windows.append(UsageWindow(
+                    id: "notion-monthly",
+                    label: AppLocalization.text("每月", "Monthly"),
+                    usedFraction: fraction,
+                    resetsAt: Self.date(fromMilliseconds: billing.periodEndMs),
+                    detail: nil
+                ))
+            }
         }
-        if let billing = rateLimit.billingPeriodWindow,
-           let fraction = Self.fraction(used: billing.used, limit: billing.limit) {
-            windows.append(UsageWindow(
-                id: "notion-monthly",
-                label: AppLocalization.text("每月", "Monthly"),
-                usedFraction: fraction,
-                resetsAt: Self.date(fromMilliseconds: billing.periodEndMs),
-                detail: nil
+
+        if let creditBalance = workspaceCreditBalance, creditBalance.isFinite {
+            details.append(UsageDetail(
+                id: "notion-workspace-credits",
+                label: AppLocalization.text("Notion Credits 剩余", "Notion Credits remaining"),
+                value: creditBalance.formatted(.number.precision(.fractionLength(0...2)))
             ))
         }
 
@@ -164,7 +296,7 @@ nonisolated struct NotionUsageSnapshot: Sendable, Equatable {
             balance: nil,
             plan: workspace?.displayTier,
             providerCost: nil,
-            details: [],
+            details: details,
             updatedAt: updatedAt,
             message: nil
         )
@@ -212,10 +344,21 @@ nonisolated enum NotionUsageParser {
         } catch {
             throw NotionUsageError.parseFailed(error.localizedDescription)
         }
-        guard status.isNotApplicable || status.window != nil || status.billingPeriodWindow != nil else {
+        guard status.hasResolvedPersonalAllowances || status.isNotApplicable || status.window != nil || status.billingPeriodWindow != nil else {
             throw NotionUsageError.parseFailed("getCreditRateLimitStatus returned no usage windows.")
         }
         return status
+    }
+
+    static func parseWorkspaceCreditBalance(_ data: Data) -> Double? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let premium = root["premiumCredits"] as? [String: Any],
+              let number = premium["totalCreditBalance"] as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite else {
+            return nil
+        }
+        return number.doubleValue
     }
 
     static func parseSpaces(_ data: Data) throws -> NotionAccount {
@@ -300,6 +443,7 @@ nonisolated enum NotionUsageFetcher {
     static let baseURL = URL(string: "https://app.notion.com")!
     static let getSpacesURL = URL(string: "https://app.notion.com/api/v3/getSpaces")!
     static let getCreditRateLimitStatusURL = URL(string: "https://app.notion.com/api/v3/getCreditRateLimitStatus")!
+    static let getAIUsageEligibilityURL = URL(string: "https://app.notion.com/api/v3/getAIUsageEligibilityV2")!
     private static let refererURL = URL(string: "https://app.notion.com/")!
     private static let userAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -418,13 +562,36 @@ nonisolated enum NotionUsageFetcher {
             session: session
         )
         let status = try NotionUsageParser.parseRateLimitStatus(data)
-        guard !status.isNotApplicable else {
+        if !status.hasResolvedPersonalAllowances, status.isNotApplicable {
+            if status.hasPersonalSchema {
+                throw NotionUsageError.personalAllowanceUnavailable
+            }
             throw NotionUsageError.allowanceNotApplicable(workspace: workspace.name)
+        }
+        // 工作区 Notion Credits 余额单独读取，失败不影响主额度返回。
+        var workspaceCreditBalance: Double?
+        do {
+            let eligibilityData = try await post(
+                url: getAIUsageEligibilityURL,
+                endpoint: "getAIUsageEligibilityV2",
+                body: ["spaceId": workspace.id],
+                context: context,
+                timeout: min(timeout, 3),
+                session: session
+            )
+            workspaceCreditBalance = NotionUsageParser.parseWorkspaceCreditBalance(eligibilityData)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            throw error
+        } catch {
+            workspaceCreditBalance = nil
         }
         return NotionUsageSnapshot(
             rateLimit: status,
             workspace: workspace,
             account: account,
+            workspaceCreditBalance: workspaceCreditBalance,
             updatedAt: now
         )
     }

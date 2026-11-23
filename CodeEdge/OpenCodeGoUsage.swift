@@ -19,6 +19,8 @@ enum OpenCodeGoUsageFetcher {
     private static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 
+    static let localHistoryScanBudget: Duration = .seconds(5)
+
     // 按设置里选的来源读取：API Key 只走接口，Cookie 只走网页会话；
     // 自动时依次用填写的凭据、浏览器会话、OpenCode CLI 的登录。
     static func fetch(
@@ -30,6 +32,7 @@ enum OpenCodeGoUsageFetcher {
         localAPIKey: () -> String? = { nil },
         browserCookie: () -> String? = { OpenCodeUsageFetcher.automaticCookieHeader() }
     ) async throws -> ProviderUsage {
+        try Task.checkCancellation()
         let normalized = normalizeAPIKey(credential)
         let manualCookie = OpenCodeUsageFetcher.requestCookieHeader(from: normalized)
         let manualKey = manualCookie == nil && !normalized.isEmpty ? normalized : nil
@@ -45,17 +48,48 @@ enum OpenCodeGoUsageFetcher {
                 return try await fetchWeb(cookie: manualCookie, workspaceID: workspaceID, session: session, now: now)
             }
             if let manualKey { return try await fetchAPI(apiKey: manualKey, session: session, now: now) }
+            try Task.checkCancellation()
             if let cookie = browserCookie() {
                 do {
                     return try await fetchWeb(cookie: cookie, workspaceID: workspaceID, session: session, now: now)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let error as URLError where error.code == .cancelled {
+                    throw error
                 } catch let error where isAuthFailure(error) {
+                    try Task.checkCancellation()
                     // 浏览器里残留的会话已失效时，继续试 CLI 登录，不能挡住有效的 Key。
                     guard let key = localAPIKey() else { throw error }
                     return try await fetchAPI(apiKey: key, session: session, now: now)
                 }
             }
+            try Task.checkCancellation()
             if let key = localAPIKey() { return try await fetchAPI(apiKey: key, session: session, now: now) }
             throw UsageCollectionError.missingCredential
+        }
+    }
+
+    // 限制自动刷新等待本地历史扫描的时间（默认 5 秒），超时后先返回权威远程额度，
+    // 后台扫描任务继续跑完以预热本地缓存，不阻塞当次刷新。
+    nonisolated static func enrichWithBoundedLocalHistory(
+        _ usage: ProviderUsage,
+        budget: Duration = localHistoryScanBudget,
+        enrich: @escaping @Sendable (ProviderUsage) -> ProviderUsage = { OpenCodeGoLocalUsageReader.enrich($0) }
+    ) async -> ProviderUsage {
+        let scanTask = Task.detached(priority: .utility) {
+            enrich(usage)
+        }
+        return await withTaskGroup(of: ProviderUsage?.self) { group in
+            group.addTask {
+                await scanTask.value
+            }
+            group.addTask {
+                try? await Task.sleep(for: budget)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first ?? usage
         }
     }
 

@@ -137,9 +137,12 @@ enum OpenAIAPIUsageFetcher {
     )!
     private static let maximumPageCount = 100
 
+    static let organizationIDEnvironmentKeys = ["OPENAI_ORGANIZATION_ID", "OPENAI_ORG_ID"]
+
     static func fetch(
         apiKey: String,
         projectID: String?,
+        organizationID: String? = nil,
         usesAdminKey: Bool,
         session: URLSession,
         now: Date = Date(),
@@ -148,6 +151,7 @@ enum OpenAIAPIUsageFetcher {
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { throw OpenAIAPIUsageError.missingCredential }
         let project = cleaned(projectID)
+        let organization = cleaned(organizationID)
 
         do {
             let snapshot = try await fetchAdminUsage(
@@ -196,7 +200,9 @@ enum OpenAIAPIUsageFetcher {
         } catch let error as OpenAIAPIUsageError {
             guard project == nil || !usesAdminKey else { throw error }
             do {
-                return try await fetchLegacyCredits(apiKey: key, session: session, now: now)
+                return try await fetchLegacyCredits(
+                    apiKey: key, organizationID: organization, session: session, now: now
+                )
             } catch {
                 throw error
             }
@@ -344,6 +350,7 @@ enum OpenAIAPIUsageFetcher {
 
     private static func fetchLegacyCredits(
         apiKey: String,
+        organizationID: String?,
         session: URLSession,
         now: Date
     ) async throws -> ProviderUsage {
@@ -352,6 +359,9 @@ enum OpenAIAPIUsageFetcher {
         request.timeoutInterval = 15
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let organizationID {
+            request.setValue(organizationID, forHTTPHeaderField: "OpenAI-Organization")
+        }
         let data: Data
         let response: URLResponse
         do {
@@ -373,6 +383,7 @@ enum OpenAIAPIUsageFetcher {
         }
         let fraction = credits.totalGranted > 0 ? credits.totalUsed / credits.totalGranted : 1
         let expiry = credits.grants?.data.compactMap(\.expiresAt).filter { $0 > now }.min()
+        let available = max(0, credits.totalAvailable)
         return ProviderUsage(
             id: ProviderID(rawValue: "openai"),
             state: .ready,
@@ -381,10 +392,17 @@ enum OpenAIAPIUsageFetcher {
                 label: "API credits",
                 usedFraction: fraction,
                 resetsAt: expiry,
-                detail: String(format: "$%.2f available", max(0, credits.totalAvailable))
+                detail: String(format: "$%.2f available", available)
             )],
-            balance: String(format: "$%.2f", max(0, credits.totalAvailable)),
+            balance: String(format: "$%.2f", available),
             plan: nil,
+            providerCost: ProviderCostSummary(
+                used: max(0, credits.totalUsed),
+                limit: max(0, credits.totalGranted),
+                currencyCode: "USD",
+                period: AppLocalization.text("API 额度", "API credits"),
+                balance: available
+            ),
             updatedAt: now,
             message: nil
         )

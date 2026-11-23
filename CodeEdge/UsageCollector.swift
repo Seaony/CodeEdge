@@ -116,7 +116,7 @@ actor UsageCollector: UsageCollecting {
             throw resolved
         }
         if descriptor.id.rawValue == "opencodego" {
-            return OpenCodeGoLocalUsageReader.enrich(usage)
+            return await OpenCodeGoUsageFetcher.enrichWithBoundedLocalHistory(usage)
         }
         let claudeUsesAdminAPI = descriptor.id.rawValue == "claude"
             && configuration.source == .token
@@ -399,10 +399,17 @@ actor UsageCollector: UsageCollecting {
                 configuration.account,
                 environment["OPENAI_PROJECT_ID"] ?? "",
             ].first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+            let savedOrganizationID = await MainActor.run {
+                ProviderPreferences.shared.auxiliarySecret(for: descriptor.id, key: "organization-id")
+            }
+            let organizationID = ([savedOrganizationID] + OpenAIAPIUsageFetcher.organizationIDEnvironmentKeys.map {
+                environment[$0] ?? ""
+            }).first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
             let usesAdminKey = !secret.isEmpty || !(environment["OPENAI_ADMIN_KEY"] ?? "").isEmpty
             return try await OpenAIAPIUsageFetcher.fetch(
                 apiKey: resolvedSecret,
                 projectID: projectID,
+                organizationID: organizationID,
                 usesAdminKey: usesAdminKey,
                 session: session
             )
@@ -428,6 +435,7 @@ actor UsageCollector: UsageCollecting {
         if descriptor.id.rawValue == "cursor" {
             return try await CursorUsageFetcher.fetch(
                 credential: resolvedSecret,
+                allowLocalSpendFallback: configuration.source == .automatic && secret.isEmpty,
                 session: session
             )
         }
@@ -650,6 +658,7 @@ actor UsageCollector: UsageCollecting {
                 credential: resolvedSecret,
                 source: configuration.source,
                 endpointOverride: configuration.endpoint.isEmpty ? nil : configuration.endpoint,
+                region: configuration.account.isEmpty ? nil : configuration.account,
                 session: session
             )
         }
@@ -933,7 +942,22 @@ actor UsageCollector: UsageCollecting {
             )
         }
         if descriptor.id.rawValue == "museai" {
-            return try await MuseAIUsageFetcher.fetch(cookieHeader: secret, session: session)
+            let cachedActionID = await MainActor.run {
+                ProviderPreferences.shared.auxiliarySecret(for: descriptor.id, key: "action-id")
+            }
+            return try await MuseAIUsageFetcher.fetch(
+                cookieHeader: secret,
+                session: session,
+                cachedActionID: cachedActionID.isEmpty ? nil : cachedActionID,
+                actionIDCacheUpdate: { value in
+                    await MainActor.run {
+                        try? ProviderPreferences.shared.setAuxiliarySecret(
+                            value ?? "", for: descriptor.id, key: "action-id",
+                            invalidatesUsage: false, expectedRevision: usageRevision
+                        )
+                    }
+                }
+            )
         }
         if descriptor.id.rawValue == "raycast" {
             return try await RaycastUsageFetcher.fetch(
@@ -958,7 +982,15 @@ actor UsageCollector: UsageCollecting {
             )
         }
         if descriptor.id.rawValue == "vercel" {
-            return try await VercelUsageFetcher.fetch(apiKey: secret.isEmpty ? nil : secret, session: session)
+            let accessToken = await MainActor.run {
+                ProviderPreferences.shared.auxiliarySecret(for: descriptor.id, key: "access-token")
+            }
+            return try await VercelUsageFetcher.fetch(
+                apiKey: secret.isEmpty ? nil : secret,
+                accessToken: accessToken.isEmpty ? nil : accessToken,
+                teamID: configuration.account.isEmpty ? nil : configuration.account,
+                session: session
+            )
         }
         if descriptor.id.rawValue == "xapi" {
             return try await XAPIUsageFetcher.fetch(cookie: secret.isEmpty ? nil : secret, session: session)
@@ -1105,10 +1137,42 @@ actor UsageCollector: UsageCollecting {
             return try await AbliterationUsageFetcher.fetch(apiKey: secret.isEmpty ? nil : secret, session: session)
         }
         if descriptor.id.rawValue == "siliconflow" {
+            let webCookie = await MainActor.run {
+                ProviderPreferences.shared.auxiliarySecret(for: descriptor.id, key: "web-cookie")
+            }
             return try await SiliconFlowUsageFetcher.fetch(
                 apiKey: secret.isEmpty ? nil : secret,
                 origin: configuration.endpoint.isEmpty ? nil : configuration.endpoint,
+                source: configuration.source,
+                cookieHeader: webCookie.isEmpty ? nil : webCookie,
+                allowBrowserImport: allowBrowserCookieImport,
                 session: session
+            )
+        }
+        if descriptor.id.rawValue == "trustedrouter" {
+            return try await TrustedRouterUsageFetcher.fetch(
+                apiKey: secret.isEmpty ? nil : secret,
+                session: session
+            )
+        }
+        if descriptor.id.rawValue == "googledeveloper" {
+            let cachedCookie = await MainActor.run {
+                ProviderPreferences.shared.auxiliarySecret(for: descriptor.id, key: "imported-cookie")
+            }
+            return try await GoogleDeveloperUsageFetcher.fetch(
+                credential: secret,
+                source: configuration.source,
+                session: session,
+                cachedCookieHeader: cachedCookie.isEmpty ? nil : cachedCookie,
+                cacheUpdate: { value in
+                    await MainActor.run {
+                        try? ProviderPreferences.shared.setAuxiliarySecret(
+                            value ?? "", for: descriptor.id, key: "imported-cookie",
+                            invalidatesUsage: false, expectedRevision: usageRevision
+                        )
+                    }
+                },
+                allowBrowserImport: allowBrowserCookieImport
             )
         }
         if descriptor.id.rawValue == "tripo" {
@@ -1477,9 +1541,20 @@ actor UsageCollector: UsageCollecting {
            let data = readKeychainViaSecurityCLI(service: service) {
             return (errSecSuccess, data)
         }
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        return (status, item as? Data)
+        let service = (query[kSecAttrService as String] as? String) ?? "Claude Code-credentials"
+        let account = query[kSecAttrAccount as String] as? String
+        return BrowserCookieAccess.readForeignKeychainItem(
+            service: service,
+            account: account,
+            requirePartition: true,
+            read: { allowPrompt in
+                var readQuery = query
+                if !allowPrompt { BrowserCookieAccess.applyNoUI(to: &readQuery) }
+                var item: CFTypeRef?
+                let status = SecItemCopyMatching(readQuery as CFDictionary, &item)
+                return (status, item as? Data)
+            }
+        )
     }
 
     private nonisolated static func readKeychainViaSecurityCLI(service: String) -> Data? {

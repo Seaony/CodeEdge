@@ -244,22 +244,63 @@ nonisolated enum MiMoCookieHeader {
 
 nonisolated enum MiMoUsageFetcher {
     static let apiURLKey = "MIMO_API_URL"
+    static let apiKeyEnvironmentKey = "MIMO_API_KEY"
+    static let tokenPlanRegionEnvironmentKey = "MIMO_TOKEN_PLAN_REGION"
     static let defaultBaseURL = URL(string: "https://platform.xiaomimimo.com/api/v1")!
     private static let cookieDomains = ["platform.xiaomimimo.com", "xiaomimimo.com"]
     private static let requestTimeout: TimeInterval = 15
+
+    static func resolvedAPIKey(
+        configured: String?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        for raw in [configured, environment[apiKeyEnvironmentKey]] {
+            guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { continue }
+            if value.count >= 2,
+               (value.first == "\"" && value.last == "\"" || value.first == "'" && value.last == "'") {
+                value = String(value.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if !value.isEmpty, MiMoCookieHeader.normalized(from: value) == nil {
+                return value
+            }
+        }
+        return nil
+    }
+
+    static func resolvedTokenPlanRegion(
+        configured: String?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        let raw = cleaned(configured) ?? cleaned(environment[tokenPlanRegionEnvironmentKey]) ?? "cn"
+        let region = raw.lowercased()
+        return ["cn", "sgp"].contains(region) ? region : nil
+    }
 
     static func fetch(
         credential: String,
         source: ProviderSource,
         endpointOverride: String? = nil,
+        region: String? = nil,
         session: URLSession,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         now: Date = Date()
     ) async throws -> ProviderUsage {
+        // 官方 Token Plan API Key 来源（cn / sgp），不触碰浏览器会话。
+        let apiKey = resolvedAPIKey(configured: source == .cookie ? nil : credential, environment: environment)
+        if source == .token || (source == .automatic && apiKey != nil) {
+            guard let apiKey else { throw MiMoUsageError.invalidCredentials }
+            return try await fetchTokenPlanAPI(
+                apiKey: apiKey,
+                region: region,
+                session: session,
+                environment: environment,
+                now: now
+            )
+        }
+
         let baseURL = try resolvedBaseURL(configured: endpointOverride, environment: environment)
         let manual = MiMoCookieHeader.normalized(from: credential)
-        let explicitWeb = source == .cookie || source == .token
-        if explicitWeb {
+        if source == .cookie {
             guard let manual else { throw credential.isEmpty ? MiMoUsageError.missingCookie : .invalidCookie }
             return try await fetchUsage(cookieHeader: manual, baseURL: baseURL, session: session, now: now)
                 .toProviderUsage()
@@ -270,6 +311,7 @@ nonisolated enum MiMoUsageFetcher {
         candidates.append(contentsOf: automaticCookieHeaders().filter { !candidates.contains($0) })
         var lastError: Error?
         for cookie in candidates {
+            try Task.checkCancellation()
             do {
                 return try await fetchUsage(cookieHeader: cookie, baseURL: baseURL, session: session, now: now)
                     .toProviderUsage()
@@ -285,6 +327,119 @@ nonisolated enum MiMoUsageFetcher {
             return local
         }
         throw webError
+    }
+
+    static func fetchTokenPlanAPI(
+        apiKey: String,
+        region configuredRegion: String? = nil,
+        session: URLSession,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        now: Date = Date()
+    ) async throws -> ProviderUsage {
+        guard let region = resolvedTokenPlanRegion(configured: configuredRegion, environment: environment) else {
+            throw MiMoUsageError.parseFailed(AppLocalization.text("API 区域必须是 cn 或 sgp", "API region must be cn or sgp"))
+        }
+        let url = URL(string: "https://token-plan-\(region).xiaomimimo.com/v1/platform/token_plan")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = requestTimeout
+        request.httpShouldHandleCookies = false
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw MiMoUsageError.networkError(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw MiMoUsageError.parseFailed(AppLocalization.text("响应无效", "Invalid response"))
+        }
+        switch http.statusCode {
+        case 200:
+            return try parseTokenPlanAPI(data, now: now)
+        case 401, 403:
+            throw MiMoUsageError.invalidCredentials
+        case 429:
+            throw MiMoUsageError.requestFailed(429)
+        default:
+            throw MiMoUsageError.requestFailed(http.statusCode)
+        }
+    }
+
+    static func parseTokenPlanAPI(_ data: Data, now: Date = Date()) throws -> ProviderUsage {
+        func invalid() -> MiMoUsageError {
+            .parseFailed(AppLocalization.text("返回了无法识别的 Token Plan 数据", "Unrecognized Token Plan response"))
+        }
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (root["object"] as? String) == "token_plan",
+              let quota = root["quota"] as? [String: Any],
+              let period = root["period"] as? [String: Any] else {
+            throw invalid()
+        }
+        func safeCount(_ value: Any?) throws -> Int64 {
+            guard let number = value as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID() else { throw invalid() }
+            let d = number.doubleValue
+            guard d.isFinite, d >= 0, d <= 9_007_199_254_740_991, d.rounded() == d else { throw invalid() }
+            return Int64(d)
+        }
+        let total = try safeCount(quota["total_credits"])
+        let used = try safeCount(quota["used_credits"])
+        let remaining = try safeCount(quota["remaining_credits"])
+        guard remaining == max(0, total - used) else { throw invalid() }
+
+        func parseUTCDate(_ value: Any?) throws -> Date? {
+            guard let value, !(value is NSNull) else { return nil }
+            guard let text = value as? String,
+                  text.range(of: #"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"#, options: .regularExpression) != nil else {
+                throw invalid()
+            }
+            let iso = text.replacingOccurrences(of: " ", with: "T") + "Z"
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime]
+            guard let parsed = formatter.date(from: iso), formatter.string(from: parsed) == iso else {
+                throw invalid()
+            }
+            return parsed
+        }
+        let start = try parseUTCDate(period["start_at"])
+        let end = try parseUTCDate(period["end_at"])
+        if let start, let end, end <= start { throw invalid() }
+        let windowMinutes: Int? = if let start, let end {
+            Int(round(end.timeIntervalSince(start) / 60))
+        } else {
+            nil
+        }
+
+        var windows: [UsageWindow] = []
+        if total > 0 {
+            let usedText = used.formatted(.number.grouping(.automatic))
+            let totalText = total.formatted(.number.grouping(.automatic))
+            windows.append(UsageWindow(
+                id: "mimo-token-plan",
+                label: "Credits",
+                usedFraction: Double(used) / Double(total),
+                resetsAt: end,
+                detail: "\(usedText) / \(totalText) Credits",
+                windowMinutes: windowMinutes
+            ))
+        }
+        let plan = (root["plan_code"] as? String).flatMap { cleaned($0) }
+        return ProviderUsage(
+            id: ProviderID(rawValue: "mimo"),
+            state: .ready,
+            windows: windows,
+            balance: nil,
+            plan: plan,
+            details: [],
+            updatedAt: now,
+            message: nil
+        )
     }
 
     static func fetchUsage(

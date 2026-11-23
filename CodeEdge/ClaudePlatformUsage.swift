@@ -149,7 +149,8 @@ nonisolated enum ClaudePlatformUsageFetcher {
                 detail: grantDescription(grant, currency: currency, now: now)
             )
         }
-        let details = grants.filter { $0.id != subscription?.id && $0.id != purchased?.id }.map { grant in
+        // 限制额外 grant 明细为前 24 条，避免大响应拖慢界面且保留主余额与消费。
+        let details = grants.filter { $0.id != subscription?.id && $0.id != purchased?.id }.prefix(24).map { grant in
             UsageDetail(id: "credit-grant-\(grant.id)", label: grant.label, value: grantDescription(grant, currency: currency, now: now))
         }
         return ProviderUsage(

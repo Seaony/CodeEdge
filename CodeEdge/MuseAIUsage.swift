@@ -49,9 +49,13 @@ nonisolated enum MuseAIUsageFetcher {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 
+    typealias ActionCacheUpdate = @Sendable (String?) async -> Void
+
     static func fetch(
         cookieHeader: String,
         session: URLSession,
+        cachedActionID: String? = nil,
+        actionIDCacheUpdate: @escaping ActionCacheUpdate = { _ in },
         now: Date = Date()
     ) async throws -> ProviderUsage {
         guard let cookie = normalizedCookie(cookieHeader) else { throw MuseAIUsageError.missingCookie }
@@ -61,13 +65,30 @@ nonisolated enum MuseAIUsageFetcher {
             delegateQueue: nil
         )
         defer { requestSession.finishTasksAndInvalidate() }
-        let actionID = try await discoverAction(cookie: cookie, session: requestSession)
-        let (body, response) = try await request(
-            path: "/", cookie: cookie, actionID: actionID, session: requestSession
-        )
-        if signedOut(response) { throw MuseAIUsageError.loginRequired }
-        if response.statusCode == 404, body.localizedCaseInsensitiveContains("server action not found") {
-            throw MuseAIUsageError.actionNotFound
+
+        let (body, response): (String, HTTPURLResponse)
+        if let existing = cachedActionID?.trimmingCharacters(in: .whitespacesAndNewlines), !existing.isEmpty {
+            let initial = try await request(path: "/", cookie: cookie, actionID: existing, session: requestSession)
+            if signedOut(initial.1) { throw MuseAIUsageError.loginRequired }
+            if !actionNeedsRediscovery(initial.1) {
+                // 408/429/500 等瞬态失败不丢弃已缓存的 actionID。
+                (body, response) = initial
+            } else {
+                await actionIDCacheUpdate(nil)
+                let freshID = try await discoverAction(cookie: cookie, session: requestSession)
+                await actionIDCacheUpdate(freshID)
+                let retried = try await request(path: "/", cookie: cookie, actionID: freshID, session: requestSession)
+                if signedOut(retried.1) { throw MuseAIUsageError.loginRequired }
+                if actionNeedsRediscovery(retried.1) { throw MuseAIUsageError.actionNotFound }
+                (body, response) = retried
+            }
+        } else {
+            let freshID = try await discoverAction(cookie: cookie, session: requestSession)
+            await actionIDCacheUpdate(freshID)
+            let fresh = try await request(path: "/", cookie: cookie, actionID: freshID, session: requestSession)
+            if signedOut(fresh.1) { throw MuseAIUsageError.loginRequired }
+            if actionNeedsRediscovery(fresh.1) { throw MuseAIUsageError.actionNotFound }
+            (body, response) = fresh
         }
         guard response.statusCode == 200 else { throw UsageCollectionError.requestFailed(response.statusCode) }
         return try parse(body, now: now)
@@ -189,7 +210,7 @@ nonisolated enum MuseAIUsageFetcher {
             request.httpMethod = "POST"
             request.httpBody = Data(#"[{"includeAgreement":true}]"#.utf8)
             request.setValue("text/x-component", forHTTPHeaderField: "Accept")
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("text/plain;charset=UTF-8", forHTTPHeaderField: "Content-Type")
             request.setValue(actionID, forHTTPHeaderField: "Next-Action")
             request.setValue(origin, forHTTPHeaderField: "Origin")
             request.setValue("same-origin", forHTTPHeaderField: "Sec-Fetch-Site")
@@ -203,13 +224,18 @@ nonisolated enum MuseAIUsageFetcher {
         return (body, http)
     }
 
+    static func actionNeedsRediscovery(_ response: HTTPURLResponse) -> Bool {
+        // muse.ai 重新部署后旧 actionID 可能返回 400、404 或 409。
+        !signedOut(response) && [400, 404, 409].contains(response.statusCode)
+    }
+
     private static func signedOut(_ response: HTTPURLResponse) -> Bool {
         response.statusCode == 401 || response.statusCode == 403
             || (response.value(forHTTPHeaderField: "Location") ?? "").hasPrefix("https://auth.muse.ai/")
     }
 
-    private static func chunkPaths(_ body: String) -> [String] {
-        guard let regex = try? NSRegularExpression(pattern: #"static/chunks/[\w~.-]+\.js"#) else { return [] }
+    static func chunkPaths(_ body: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: #"static/(?:immutable/)?chunks/[\w~.-]+\.js"#) else { return [] }
         var seen = Set<String>()
         return regex.matches(in: body, range: NSRange(body.startIndex..., in: body)).compactMap { match in
             guard let range = Range(match.range, in: body) else { return nil }

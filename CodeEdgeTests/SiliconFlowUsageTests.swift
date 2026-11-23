@@ -58,8 +58,11 @@ struct SiliconFlowUsageTests {
 
     @Test
     func bodyCodesMapToRefusedAndAuthErrors() {
-        #expect(throws: SiliconFlowUsageError.balanceQueryRefused) {
+        #expect(throws: SiliconFlowUsageError.chinaBalanceAPIRetired) {
             try SiliconFlowUsageFetcher.parse(Data(#"{"code":20092,"status":false}"#.utf8), currency: "CNY")
+        }
+        #expect(throws: SiliconFlowUsageError.balanceQueryRefused) {
+            try SiliconFlowUsageFetcher.parse(Data(#"{"code":20092,"status":false}"#.utf8), currency: "USD")
         }
         #expect(throws: SiliconFlowUsageError.authenticationExpired) {
             try SiliconFlowUsageFetcher.parse(Data(#"{"code":30014,"message":"x"}"#.utf8), currency: "CNY")
@@ -132,7 +135,7 @@ struct SiliconFlowUsageTests {
     @Test(arguments: [
         (401, SiliconFlowUsageError.authenticationExpired),
         (403, SiliconFlowUsageError.authenticationExpired),
-        (410, SiliconFlowUsageError.balanceQueryRefused),
+        (410, SiliconFlowUsageError.chinaBalanceAPIRetired),
         (429, SiliconFlowUsageError.rateLimited),
         (500, SiliconFlowUsageError.providerUnavailable(500)),
         (404, SiliconFlowUsageError.apiFailure(404)),

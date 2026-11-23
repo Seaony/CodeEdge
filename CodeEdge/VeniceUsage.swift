@@ -56,8 +56,19 @@ nonisolated struct VeniceUsageSnapshot: Sendable, Equatable {
         let balance: String?
         if !canConsume {
             fraction = 1
-            detail = "Balance unavailable for API calls"
-            balance = nil
+            let knownUSD = usd != nil && (currency == "USD" || diem == nil)
+            if knownUSD, let usd {
+                let text = Self.formatUSD(usd)
+                detail = text
+                balance = text
+            } else if let diem {
+                let text = String(format: "DIEM %.2f", diem)
+                detail = text
+                balance = text
+            } else {
+                detail = "Balance unavailable for API calls"
+                balance = nil
+            }
         } else if currency == "USD", let usd, usd > 0 {
             fraction = 0
             detail = String(format: "$%.2f USD remaining", usd)
@@ -98,6 +109,10 @@ nonisolated struct VeniceUsageSnapshot: Sendable, Equatable {
             updatedAt: updatedAt,
             message: nil
         )
+    }
+
+    private static func formatUSD(_ value: Double) -> String {
+        value < 0 ? String(format: "-$%.2f", -value) : String(format: "$%.2f", value)
     }
 }
 

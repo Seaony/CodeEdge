@@ -63,9 +63,36 @@ nonisolated enum AmpUsageFetcher {
         let freeResetDescription: String?
         let individualCredits: Double?
         let workspaceBalances: [WorkspaceBalance]
+        let enterpriseWorkspaces: [String]
         let accountEmail: String?
         let accountOrganization: String?
         let subscription: Subscription?
+
+        init(
+            freeQuota: Double?,
+            freeUsed: Double?,
+            hourlyReplenishment: Double?,
+            windowHours: Double?,
+            freeResetDescription: String?,
+            individualCredits: Double?,
+            workspaceBalances: [WorkspaceBalance],
+            enterpriseWorkspaces: [String] = [],
+            accountEmail: String?,
+            accountOrganization: String?,
+            subscription: Subscription?
+        ) {
+            self.freeQuota = freeQuota
+            self.freeUsed = freeUsed
+            self.hourlyReplenishment = hourlyReplenishment
+            self.windowHours = windowHours
+            self.freeResetDescription = freeResetDescription
+            self.individualCredits = individualCredits
+            self.workspaceBalances = workspaceBalances
+            self.enterpriseWorkspaces = enterpriseWorkspaces
+            self.accountEmail = accountEmail
+            self.accountOrganization = accountOrganization
+            self.subscription = subscription
+        }
     }
 
     private struct FreeUsage {
@@ -152,6 +179,8 @@ nonisolated enum AmpUsageFetcher {
             + #"\s*%\s+remaining(?:\s+today)?(?:\s*(\(resets\s+daily\)))?"#
         let creditsPattern = #"(?im)^\s*Individual credits:\s*\$?"# + amount + #"\s+remaining"#
         let workspacePattern = #"(?im)^\s*Workspace\s+(.+?):\s*\$?"# + amount + #"\s+remaining"#
+        // 企业付费工作区只报“usage paid by your enterprise”，不返回余额数字。
+        let enterprisePattern = #"(?im)^\s*Workspace\s+(.+?):\s*usage\s+paid\s+by\s+your\s+enterprise\b"#
         let subscriptionSuffix = #"\s*"# + amount
             + #"\s*%\s+other\s+usage\s+and\s+"# + amount
             + #"\s*%\s+orb\s+usage\s+remaining\s*-\s*resets\s+upon\s+renewal\s+in\s+"#
@@ -197,6 +226,8 @@ nonisolated enum AmpUsageFetcher {
             }
             return WorkspaceBalance(name: name, remaining: remaining)
         }
+        let enterpriseWorkspaces = allCaptures(enterprisePattern, in: text)
+            .compactMap { nonEmpty($0.first) }
         let subscription: Subscription? = {
             if let fields = captures(tierPattern, in: text),
                let remaining = number(fields[1]),
@@ -247,7 +278,8 @@ nonisolated enum AmpUsageFetcher {
             )
         }()
 
-        guard free != nil || subscription != nil || individualCredits != nil || !workspaces.isEmpty else {
+        guard free != nil || subscription != nil || individualCredits != nil
+            || !workspaces.isEmpty || !enterpriseWorkspaces.isEmpty else {
             throw AmpUsageError.parseFailed("Missing Amp usage data")
         }
         return Snapshot(
@@ -258,6 +290,7 @@ nonisolated enum AmpUsageFetcher {
             freeResetDescription: free?.resetDescription,
             individualCredits: individualCredits,
             workspaceBalances: workspaces,
+            enterpriseWorkspaces: enterpriseWorkspaces,
             accountEmail: nonEmpty(identity?[0]),
             accountOrganization: nonEmpty(identity?[1]),
             subscription: subscription
@@ -359,12 +392,20 @@ nonisolated enum AmpUsageFetcher {
                 value: usd(workspace.remaining)
             )
         })
+        details.append(contentsOf: snapshot.enterpriseWorkspaces.enumerated().map { index, workspace in
+            UsageDetail(
+                id: "amp-enterprise-workspace-\(index)",
+                label: "Workspace \(workspace)",
+                value: AppLocalization.text("企业版", "Enterprise")
+            )
+        })
+        let fallbackPlan: String? = primary.isEmpty && !snapshot.enterpriseWorkspaces.isEmpty ? "Enterprise" : nil
         return ProviderUsage(
             id: ProviderID(rawValue: "amp"),
             state: .ready,
             windows: primary,
             additionalWindows: additional,
-            plan: snapshot.subscription?.plan,
+            plan: snapshot.subscription?.plan ?? fallbackPlan,
             details: details,
             updatedAt: now,
             message: nil

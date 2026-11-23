@@ -610,9 +610,18 @@ nonisolated enum ClaudeCLIUsageFetcher {
         }
     }
 
-    private static func usageComplete(_ text: String) -> Bool {
+    static func usageComplete(_ text: String) -> Bool {
         let context = LabelContext(quotaPanel(latestUsagePanel(text) ?? text))
-        return extractPercent(label: "Current session", context: context) != nil
+        if extractPercent(label: "Current session", context: context) != nil { return true }
+        // 仅含周额度的计划没有 5 小时行，出现任意周额度百分比就视为采集完成，避免白等超时。
+        if extractPercent(label: "Current week (all models)", context: context) != nil { return true }
+        if !scopedWeekly(context).isEmpty { return true }
+        let normalized = normalizeLabel(context.lines.joined(separator: "\n"))
+        if let range = normalized.range(of: "currentweek"),
+           normalized[range.upperBound...].range(of: #"[0-9]{1,3}(?:\.[0-9]+)?%"#, options: .regularExpression) != nil {
+            return true
+        }
+        return false
     }
 
     // 传入已归一化（只剩小写字母和数字）的输出，最后一个 "Esc to cancel" 前紧跟 "Refreshing" 就表示还在刷新。

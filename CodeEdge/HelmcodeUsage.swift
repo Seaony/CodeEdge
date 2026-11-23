@@ -88,8 +88,10 @@ nonisolated enum HelmcodeUsageFetcher {
             for domain in candidate.cookieDomains {
                 let query = BrowserCookieQuery(domains: [domain, "www.\(domain)"], domainMatch: .exact)
                 for browser in Browser.defaultImportOrder {
+                    try Task.checkCancellation()
                     guard let sources = try? BrowserCookieAccess.records(matching: query, in: browser, client: client) else { continue }
                     for imported in sources where !imported.records.isEmpty {
+                        try Task.checkCancellation()
                         let cookies = BrowserCookieClient.makeHTTPCookies(imported.records, origin: query.origin)
                         let header = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
                         guard !header.isEmpty else { continue }
@@ -113,12 +115,116 @@ nonisolated enum HelmcodeUsageFetcher {
         session: URLSession,
         now: Date
     ) async throws -> ProviderUsage {
+        // 先读新版账期 Credit 计划；只有 404 或显式 disabled 时才回退旧版 Token 额度。
+        if let creditData = try await request(
+            "/api/usage/credits", cookie: cookie, tenant: tenant, timeout: 8, allowNotFound: true, session: session
+        ) {
+            if let creditUsage = try parseCreditPlan(creditData, tenantName: tenant.name, now: now) {
+                return creditUsage
+            }
+        }
         let quota = try await request("/api/usage/quota", cookie: cookie, tenant: tenant, timeout: 8, session: session)
+        guard let quota else { throw HelmcodeUsageError.apiError(404) }
         let billing = try? await request("/api/billing", cookie: cookie, tenant: tenant, timeout: 2, session: session)
         let credits = tenant.domain == "helmcode.com"
             ? try? await request("/api/billing/credits", cookie: cookie, tenant: tenant, timeout: 2, session: session)
             : nil
         return try parse(quota: quota, billing: billing, credits: credits, tenantName: tenant.name, now: now)
+    }
+
+    static func parseCreditPlan(
+        _ data: Data,
+        tenantName: String = "Helmcode Cloud",
+        now: Date = Date()
+    ) throws -> ProviderUsage? {
+        guard let root = object(data) else { throw HelmcodeUsageError.invalidResponse("invalid JSON") }
+        guard let enabledNum = root["enabled"] as? NSNumber,
+              CFGetTypeID(enabledNum) == CFBooleanGetTypeID() else {
+            throw HelmcodeUsageError.invalidResponse("enabled")
+        }
+        guard enabledNum.boolValue else { return nil }
+
+        let allowance = try amount(root["allowanceCredits"], field: "allowanceCredits", fractional: true)
+        let spent = try amount(root["usedCredits"], field: "usedCredits", fractional: true)
+        guard allowance > 0 else { throw HelmcodeUsageError.invalidResponse("allowanceCredits") }
+
+        let start = (root["periodStart"] as? String).flatMap(date)
+        let end = (root["periodEnd"] as? String).flatMap(date)
+        let windowMinutes: Int? = if let start, let end, end > start {
+            Int(round(end.timeIntervalSince(start) / 60))
+        } else {
+            nil
+        }
+
+        var details: [UsageDetail] = [
+            UsageDetail(id: "tenant", label: AppLocalization.text("租户", "Tenant"), value: tenantName),
+        ]
+        if let pack = root["packCredits"], !(pack is NSNull) {
+            let value = try amount(pack, field: "packCredits", fractional: true)
+            details.append(UsageDetail(
+                id: "helmcode-topup-credits",
+                label: AppLocalization.text("充值 Credits", "Top-up credits"),
+                value: formatCredit(value)
+            ))
+        }
+        if let frozen = root["frozen"] as? NSNumber,
+           CFGetTypeID(frozen) == CFBooleanGetTypeID(), frozen.boolValue {
+            details.append(UsageDetail(
+                id: "helmcode-frozen",
+                label: AppLocalization.text("宽限期暂停", "Paused during grace period"),
+                value: "—"
+            ))
+        }
+
+        let rawModels = (root["models"] as? [Any]) ?? []
+        var parsedModels: [(label: String, used: String, weight: String)] = []
+        for raw in rawModels {
+            guard let row = raw as? [String: Any],
+                  let name = row["model"] as? String,
+                  !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  name.count <= 120,
+                  name.rangeOfCharacter(from: .controlCharacters) == nil else {
+                throw HelmcodeUsageError.invalidResponse("credit model")
+            }
+            let usedText = try optionalCreditText(row["creditsThisMonth"], field: "creditsThisMonth")
+            let weightText = try optionalCreditText(row["approxCreditsPerMTokens"], field: "approxCreditsPerMTokens")
+            parsedModels.append((name, usedText, weightText))
+        }
+        for (index, model) in parsedModels.prefix(20).enumerated() {
+            let combined = model.weight == "—"
+                ? model.used
+                : "\(model.used) (\(model.weight)/1M)"
+            details.append(UsageDetail(
+                id: "helmcode-credit-model-\(index)",
+                label: model.label,
+                value: combined
+            ))
+        }
+        if parsedModels.count > 20 {
+            details.append(UsageDetail(
+                id: "helmcode-credit-other-models",
+                label: AppLocalization.text("其他模型", "Other models"),
+                value: "—"
+            ))
+        }
+
+        return ProviderUsage(
+            id: ProviderID(rawValue: "helmcode"),
+            state: .ready,
+            windows: [UsageWindow(
+                id: "helmcode-credits",
+                label: "Credits",
+                usedFraction: spent / allowance,
+                resetsAt: end,
+                detail: "\(formatCredit(spent)) / \(formatCredit(allowance))",
+                windowMinutes: windowMinutes
+            )],
+            additionalWindows: [],
+            providerCost: nil,
+            details: details,
+            updatedAt: now,
+            message: nil
+        )
     }
 
     static func parse(
@@ -198,8 +304,9 @@ nonisolated enum HelmcodeUsageFetcher {
         cookie: String,
         tenant: Tenant,
         timeout: TimeInterval,
+        allowNotFound: Bool = false,
         session: URLSession
-    ) async throws -> Data {
+    ) async throws -> Data? {
         var request = URLRequest(url: URL(string: "https://cloud-api.\(tenant.domain)\(path)")!)
         request.timeoutInterval = timeout
         request.setValue(cookie, forHTTPHeaderField: "Cookie")
@@ -211,6 +318,7 @@ nonisolated enum HelmcodeUsageFetcher {
         if (300..<400).contains(http.statusCode) || http.statusCode == 401 || http.statusCode == 403 {
             throw HelmcodeUsageError.invalidSession
         }
+        if allowNotFound, http.statusCode == 404 { return nil }
         guard (200..<300).contains(http.statusCode) else { throw HelmcodeUsageError.apiError(http.statusCode) }
         return data
     }
@@ -263,6 +371,29 @@ nonisolated enum HelmcodeUsageFetcher {
         if let result = formatter.date(from: value) { return result }
         formatter.formatOptions.insert(.withFractionalSeconds)
         return formatter.date(from: value)
+    }
+
+    private static func amount(_ value: Any?, field: String, fractional: Bool = false) throws -> Double {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+            throw HelmcodeUsageError.invalidResponse(field)
+        }
+        let result = number.doubleValue
+        guard result.isFinite, result >= 0 else { throw HelmcodeUsageError.invalidResponse(field) }
+        if !fractional {
+            guard result <= 9_007_199_254_740_991, result.rounded(.towardZero) == result else {
+                throw HelmcodeUsageError.invalidResponse(field)
+            }
+        }
+        return result
+    }
+
+    private static func optionalCreditText(_ value: Any?, field: String) throws -> String {
+        if value == nil || value is NSNull { return "—" }
+        return formatCredit(try amount(value, field: field, fractional: true))
+    }
+
+    private static func formatCredit(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0...3)))
     }
 
     private static func format(_ value: Double) -> String {

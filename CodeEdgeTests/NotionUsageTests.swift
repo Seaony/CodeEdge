@@ -253,9 +253,14 @@ struct NotionUsageTests {
 
         #expect(snapshot.workspace?.id == Self.businessSpaceID)
         #expect(requests.map(\.url) == [
-            NotionUsageFetcher.getSpacesURL, NotionUsageFetcher.getCreditRateLimitStatusURL,
+            NotionUsageFetcher.getSpacesURL,
+            NotionUsageFetcher.getCreditRateLimitStatusURL,
+            NotionUsageFetcher.getAIUsageEligibilityURL,
         ])
-        #expect(requests.allSatisfy { $0.httpMethod == "POST" && $0.timeoutInterval == 7 })
+        #expect(requests.allSatisfy { $0.httpMethod == "POST" })
+        #expect(requests[0].timeoutInterval == 7)
+        #expect(requests[1].timeoutInterval == 7)
+        #expect(requests[2].timeoutInterval == 3)
         #expect(requests[0].httpBody == Data("{}".utf8))
         let bodyObject = try JSONSerialization.jsonObject(with: requests[1].httpBody ?? Data())
         let body = try #require(bodyObject as? [String: String])

@@ -62,7 +62,9 @@ nonisolated enum TypeSafeUsageFetcher {
         guard allowBrowserImport else { throw lastError }
         // 按浏览器逐个读取，第一个会话验证成功就停，不去碰后面浏览器的钥匙串。
         for browser in Browser.defaultImportOrder {
+            try Task.checkCancellation()
             for cookie in automaticCookies(in: browser) {
+                try Task.checkCancellation()
                 do {
                     let usage = try await fetchUsage(cookie: cookie, now: now)
                     await cacheUpdate(cookie)
@@ -75,6 +77,25 @@ nonisolated enum TypeSafeUsageFetcher {
         throw lastError
     }
 
+    private static let userAgent =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            + "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+
+    static func makeBillingOverviewRequest(cookie: String) -> URLRequest {
+        var request = URLRequest(url: overviewURL)
+        request.timeoutInterval = 10
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        // 账单概览接口校验同源请求头，不带会被拒绝，即使会话本身有效。
+        request.setValue(origin, forHTTPHeaderField: "Origin")
+        request.setValue(origin + "/billing", forHTTPHeaderField: "Referer")
+        request.setValue("same-origin", forHTTPHeaderField: "Sec-Fetch-Site")
+        request.setValue("cors", forHTTPHeaderField: "Sec-Fetch-Mode")
+        request.setValue("empty", forHTTPHeaderField: "Sec-Fetch-Dest")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
     private static func fetchUsage(cookie: String, now: Date) async throws -> ProviderUsage {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpCookieStorage = nil
@@ -82,17 +103,18 @@ nonisolated enum TypeSafeUsageFetcher {
         configuration.timeoutIntervalForResource = 90
         let session = URLSession(configuration: configuration, delegate: TypeSafeRedirectGuard(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
-        var request = URLRequest(url: overviewURL)
-        request.timeoutInterval = 10
-        request.setValue(cookie, forHTTPHeaderField: "Cookie")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let request = makeBillingOverviewRequest(cookie: cookie)
         let (data, response) = try await FetchDiagnostics.data(for: request, session: session)
         guard let http = response as? HTTPURLResponse else { throw TypeSafeUsageError.parseFailed }
-        try validate(status: http.statusCode, location: http.value(forHTTPHeaderField: "Location"))
-        return try parse(String(decoding: data, as: UTF8.self), now: now)
+        let body = String(decoding: data, as: UTF8.self)
+        try validate(status: http.statusCode, location: http.value(forHTTPHeaderField: "Location"), body: body)
+        return try parse(body, now: now)
     }
 
-    static func validate(status: Int, location: String?) throws {
+    static func validate(status: Int, location: String?, body: String = "") throws {
+        if status == 403, body.range(of: "cross-origin request refused", options: .caseInsensitive) != nil {
+            throw TypeSafeUsageError.billingUnavailable
+        }
         if status == 401 || status == 403 { throw TypeSafeUsageError.sessionExpired }
         // 只有跳到登录页才算会话失效，账单路由迁移这类跳转按接口异常处理
         if (300..<400).contains(status) {

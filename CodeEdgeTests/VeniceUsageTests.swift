@@ -63,7 +63,8 @@ struct VeniceUsageTests {
         {"canConsume":false,"consumptionCurrency":"USD","balances":{"diem":null,"usd":100},"diemEpochAllocation":null}
         """)
         #expect(usage.windows[0].usedFraction == 1)
-        #expect(usage.windows[0].detail == "Balance unavailable for API calls")
+        #expect(usage.windows[0].detail == "$100.00")
+        #expect(usage.balance == "$100.00")
     }
 
     @Test

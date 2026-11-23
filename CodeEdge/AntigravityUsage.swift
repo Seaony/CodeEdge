@@ -1215,18 +1215,21 @@ nonisolated enum AntigravityUsageFetcher {
         return URLSession(configuration: configuration, delegate: AntigravityLocalTrustDelegate(), delegateQueue: nil)
     }()
 
-    private static func resolveCommandBinary(environment: [String: String]) -> String? {
+    static func resolveCommandBinary(
+        environment: [String: String],
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+    ) -> String? {
         let manager = FileManager.default
         if let value = environment["ANTIGRAVITY_CLI_PATH"] {
             guard let override = clean(value) else { return nil }
-            return manager.isExecutableFile(atPath: override) ? override : nil
+            return isExecutable(override) ? override : nil
         }
         let path = clean(environment["PATH"])
             ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         for directory in path.split(separator: ":") {
             let candidate = URL(fileURLWithPath: String(directory), isDirectory: true)
                 .appending(path: "agy").path
-            if manager.isExecutableFile(atPath: candidate) { return candidate }
+            if isExecutable(candidate) { return candidate }
         }
         let home = clean(environment["HOME"]).map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? manager.homeDirectoryForCurrentUser
@@ -1234,7 +1237,9 @@ nonisolated enum AntigravityUsageFetcher {
             home.appending(path: ".local/bin/agy").path,
             "/opt/homebrew/bin/agy",
             "/usr/local/bin/agy",
-        ] where manager.isExecutableFile(atPath: candidate) {
+            "/Applications/Gemini.app/Contents/Helpers/agy",
+            home.appending(path: "Applications/Gemini.app/Contents/Helpers/agy").path,
+        ] where isExecutable(candidate) {
             return candidate
         }
         return nil

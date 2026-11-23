@@ -81,9 +81,8 @@ nonisolated enum MuseUsageFetcher {
         environment: [String: String],
         homeDirectory: URL,
         readKeychain: (_ allowPrompt: Bool) -> (OSStatus, Data?) = readKeychainItem,
-        keychainItemExists: () -> Bool = {
-            BrowserCookieAccess.foreignKeychainItemExists(service: keychainService, account: "meta")
-        }
+        preflightKeychain: (() -> BrowserCookieAccess.KeychainPreflightOutcome)? = nil,
+        keychainItemExists: (() -> Bool)? = nil
     ) throws -> String {
         if source != .account,
            let token = cleaned(configuredToken) ?? cleaned(environment["MUSE_DEVICE_TOKEN"]) {
@@ -100,10 +99,21 @@ nonisolated enum MuseUsageFetcher {
            let token = cleaned(meta["access_token"] as? String) {
             return try requireDeviceToken(token)
         }
-        // OAuth 登录的令牌存在钥匙串里，授权规则见 BrowserCookieAccess.readForeignKeychainItem。
-        let (status, data) = BrowserCookieAccess.readForeignKeychainItem(
-            service: keychainService, read: readKeychain, exists: keychainItemExists
-        )
+        // Muse CLI 刷新令牌会重写签名团队分区列表，读取前必须做分区预检，避免后台反复弹窗。
+        let (status, data): (OSStatus, Data?)
+        if let keychainItemExists, preflightKeychain == nil {
+            (status, data) = BrowserCookieAccess.readForeignKeychainItem(
+                service: keychainService, read: readKeychain, exists: keychainItemExists
+            )
+        } else {
+            (status, data) = BrowserCookieAccess.readForeignKeychainItem(
+                service: keychainService,
+                account: "meta",
+                requirePartition: true,
+                preflight: preflightKeychain,
+                read: readKeychain
+            )
+        }
         if status == errSecInteractionNotAllowed || status == errSecAuthFailed
             || [errSecUserCanceled, errSecNoAccessForItem].contains(status) {
             throw MuseUsageError.keychainAccessNotGranted
