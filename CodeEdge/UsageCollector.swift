@@ -1627,7 +1627,8 @@ actor UsageCollector: UsageCollecting {
         else { return nil }
         return DailyTokenUsage(
             tokens: estimatedTokens(localTokens: localUsage.tokens, usedFraction: usedFraction),
-            valueUSD: localUsage.valueUSD.map { $0 / usedFraction }
+            valueUSD: localUsage.valueUSD.map { $0 / usedFraction },
+            partialValueUSD: localUsage.partialValueUSD.map { $0 / usedFraction }
         )
     }
 

@@ -157,8 +157,30 @@ struct ProviderDetailCard: View {
     }
 
     private var weeklyEstimateValue: String {
-        guard let value = usage.weeklyEstimate?.valueUSD else { return "—" }
-        return "≈ " + compactDollarValue(value)
+        Self.formattedWeeklyEstimate(usage.weeklyEstimate)
+    }
+
+    static func formattedWeeklyEstimate(_ estimate: DailyTokenUsage?) -> String {
+        if let value = estimate?.valueUSD {
+            return "≈ " + compactDollarValue(value)
+        }
+        if let tokens = estimate?.tokens, tokens > 0 {
+            return "≈ " + formatDetailTokensInMillions(tokens)
+        }
+        return "—"
+    }
+
+    private var weeklyEstimateHelp: String {
+        if usage.weeklyEstimate?.valueUSD == nil, (usage.weeklyEstimate?.tokens ?? 0) > 0 {
+            return copy.text(
+                "部分模型暂无公开单价，按本地 Token 用量和官方已用比例推算每周 Token 量，不是官方额度。",
+                "Some models have no published price; estimated weekly tokens from local usage and the reported usage fraction, not an official allowance."
+            )
+        }
+        return copy.text(
+            "根据本地用量、模型价格和官方已用比例推算的每周金额，不是官方金额额度。",
+            "Estimated weekly amount from local usage, model prices, and the reported usage fraction; not an official monetary allowance."
+        )
     }
 
     private var displayedWindows: [UsageWindow] {
@@ -613,11 +635,10 @@ struct ProviderDetailCard: View {
             Text("\(weeklyEstimateValue) " + copy.text("每周估算", "Weekly estimate"))
                 .monospacedDigit()
                 .lineLimit(1)
-                .contentTransition(.numericText(value: usage.weeklyEstimate?.valueUSD ?? 0))
-                .help(copy.text(
-                    "根据本地用量、模型价格和官方已用比例推算的每周金额，不是官方金额额度。",
-                    "Estimated weekly amount from local usage, model prices, and the reported usage fraction; not an official monetary allowance."
-                ))
+                .contentTransition(
+                    .numericText(value: usage.weeklyEstimate?.valueUSD ?? Double(usage.weeklyEstimate?.tokens ?? 0))
+                )
+                .help(weeklyEstimateHelp)
         }
         .font(.system(size: 10.5, weight: .semibold, design: .rounded))
         .foregroundStyle(AppTheme.primaryText(for: colorScheme).opacity(0.42))

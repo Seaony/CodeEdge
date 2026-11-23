@@ -47,4 +47,24 @@ struct UsageCollectorWeeklyWindowTests {
 
         #expect(UsageCollector.weeklyWindow(in: usage, descriptor: descriptor) == nil)
     }
+
+    @Test
+    func formatsWeeklyEstimateAsTokensWhenPricingIsUnavailable() {
+        #expect(
+            ProviderDetailCard.formattedWeeklyEstimate(
+                DailyTokenUsage(tokens: 84_300_000, valueUSD: 41.56)
+            ) == "≈ $41.56"
+        )
+        #expect(
+            ProviderDetailCard.formattedWeeklyEstimate(
+                DailyTokenUsage(tokens: 84_300_000, valueUSD: nil, partialValueUSD: 0.86)
+            ) == "≈ 84.3M"
+        )
+        #expect(
+            ProviderDetailCard.formattedWeeklyEstimate(
+                DailyTokenUsage(tokens: 0, valueUSD: nil)
+            ) == "—"
+        )
+        #expect(ProviderDetailCard.formattedWeeklyEstimate(nil) == "—")
+    }
 }
