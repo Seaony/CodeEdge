@@ -186,6 +186,8 @@ nonisolated enum AntigravityUsageFetcher {
     private static let userQuotaPath = "/v1internal:retrieveUserQuota"
     private static let userQuotaSummaryPath = "/v1internal:retrieveUserQuotaSummary"
     private static let tokenURL = URL(string: "https://oauth2.googleapis.com/token")!
+    // 汇总接口会现场去问 Google，实测 0.5～2.3 秒；超时就退回逐模型数据，没有周额度，所以多给些时间。
+    private static let quotaSummaryTimeout: TimeInterval = 5
     private static let credentialsEnvironmentKey = "ANTIGRAVITY_OAUTH_CREDENTIALS_JSON"
     private static let otherFamilyAbbreviation = String(UnicodeScalar(71)!)
         + String(UnicodeScalar(80)!) + String(UnicodeScalar(84)!)
@@ -299,13 +301,14 @@ nonisolated enum AntigravityUsageFetcher {
             email: claims.email ?? clean(credentials.email),
             plan: plan(codeAssist: codeAssist, hostedDomain: claims.hostedDomain)
         )
+        let summaryStartedAt = Date()
         do {
             let summary = try await requestJSON(
                 path: userQuotaSummaryPath,
                 accessToken: accessToken,
                 body: modelBody,
                 session: session,
-                timeout: 2,
+                timeout: quotaSummaryTimeout,
                 host: dailyBaseURL
             )
             try Task.checkCancellation()
@@ -322,6 +325,7 @@ nonisolated enum AntigravityUsageFetcher {
             throw AntigravityUsageError.notLoggedIn
         } catch {
             try Task.checkCancellation()
+            logQuotaSummaryFailure(error, source: "OAuth", startedAt: summaryStartedAt, finishedAt: nil)
         }
         let models: [ModelQuota]
         do {
@@ -700,14 +704,28 @@ nonisolated enum AntigravityUsageFetcher {
     private static func fetchLocal(endpoints: [LocalEndpoint], now: Date) async throws -> ProviderUsage {
         var lastError: Error = AntigravityUsageError.localServiceUnavailable
         for endpoint in unique(endpoints) {
+            let summaryStartedAt = Date()
+            var summaryFinishedAt: Date?
             do {
-                let summaryData = try await localRequest(path: quotaSummaryPath, body: ["forceRefresh": true], endpoint: endpoint)
+                let summaryData = try await localRequest(
+                    path: quotaSummaryPath,
+                    body: ["forceRefresh": true],
+                    endpoint: endpoint,
+                    timeout: quotaSummaryTimeout
+                )
+                summaryFinishedAt = Date()
                 let identityData = try? await localRequest(path: userStatusPath, body: localMetadataBody, endpoint: endpoint)
                 return try parseQuotaSummary(data: summaryData, identityData: identityData, now: now)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 lastError = error
+                logQuotaSummaryFailure(
+                    error,
+                    source: "Local API \(endpoint.scheme):\(endpoint.port)",
+                    startedAt: summaryStartedAt,
+                    finishedAt: summaryFinishedAt
+                )
             }
             do {
                 let statusData = try await localRequest(path: userStatusPath, body: localMetadataBody, endpoint: endpoint)
@@ -737,7 +755,19 @@ nonisolated enum AntigravityUsageFetcher {
     ) -> ProviderUsage {
         let normalized = models.filter { $0.remainingFraction != nil }.map(normalize)
         let selectable = normalized.filter { !$0.isLite && !$0.isImage && !$0.isAutocomplete }
-        let gemini = representative(selectable.filter { $0.family == .gemini })
+        // 共用一个额度池的模型剩余比例和重置时间完全一样。成员最多的一组算 Gemini 共享池，
+        // 和它不一致的（如 Pro 账号 Argon 的单独额度）另列一行，不并进代表行。
+        // 同一模型的多个旧 ID 会归成一个，先合并成一条（取最紧的），免得一个模型投多票。
+        let geminiModels = Dictionary(
+            grouping: selectable.filter { $0.family == .gemini },
+            by: { $0.quota.modelID.lowercased() }
+        ).values.compactMap(representative)
+        let geminiGroups = Dictionary(grouping: geminiModels, by: poolKey).values
+        let largestGroup = geminiGroups.map(\.count).max() ?? 0
+        let gemini = representative(geminiGroups.filter { $0.count == largestGroup }.flatMap { $0 })
+        let separateGeminiIDs = Set(geminiModels.filter { model in
+            gemini.map { poolKey(model) != poolKey($0) } ?? false
+        }.map(\.quota.modelID))
         let other = representative(selectable.filter { $0.family == .other })
         var core: [UsageWindow] = []
         if let gemini { core.append(window(gemini.quota, id: "antigravity-gemini", label: "Gemini Models")) }
@@ -754,8 +784,14 @@ nonisolated enum AntigravityUsageFetcher {
         }
 
         let represented = Set(core.map(\.id))
+        // 只有未知模型时，代表行用的是带前缀的 ID，这里按模型 ID 再排除一次，免得同一个模型显示两遍。
+        let representedModelIDs = Set(core.compactMap { window -> String? in
+            let prefix = "antigravity-fallback-"
+            return window.id.hasPrefix(prefix) ? String(window.id.dropFirst(prefix.count)) : nil
+        })
         let distinctCandidates = normalized.filter { model in
-            return (model.isLite || model.isImage || model.isAutocomplete || model.family == .unknown)
+            return (model.isLite || model.isImage || model.isAutocomplete || model.family == .unknown
+                || separateGeminiIDs.contains(model.quota.modelID))
                 && model.quota.remainingFraction ?? 1 < 0.999
         }
         let distinct = Dictionary(grouping: distinctCandidates, by: { $0.quota.modelID.lowercased() })
@@ -766,12 +802,27 @@ nonisolated enum AntigravityUsageFetcher {
             }
         let extras = distinct.sorted(by: modelOrder).map {
             window($0.quota, id: $0.quota.modelID, label: displayLabel($0.quota))
-        }.filter { !represented.contains($0.id) }
+        }.filter { !represented.contains($0.id) && !representedModelIDs.contains($0.id) }
 
         return ProviderUsage(
             id: ProviderID(rawValue: "antigravity"), state: .ready, windows: core,
             additionalWindows: extras, balance: nil, plan: identity.plan,
             details: [], updatedAt: now, message: nil
+        )
+    }
+
+    private struct PoolKey: Hashable {
+        var remainingFraction: Double?
+        var resetsAt: Date?
+        var modelID: String?
+    }
+
+    // 没有重置时间就无法确认同池，单独成组。
+    private static func poolKey(_ model: NormalizedModel) -> PoolKey {
+        PoolKey(
+            remainingFraction: model.quota.remainingFraction,
+            resetsAt: model.quota.resetsAt,
+            modelID: model.quota.resetsAt == nil ? model.quota.modelID.lowercased() : nil
         )
     }
 
@@ -796,7 +847,8 @@ nonisolated enum AntigravityUsageFetcher {
         if combined.contains("claude") || combined.contains(otherFamilyAbbreviation.lowercased())
             || combined.contains(otherVendorName) {
             family = .other
-        } else if combined.contains("gemini") && (combined.contains("pro") || combined.contains("flash")) {
+        } else if combined.contains("gemini") || combined.contains("orchestrator") {
+            // 汇总接口的「Gemini Models」组里列着 Gemini 4 各型号和 Orchestrator，它们和 Flash 共用同一个额度池。
             family = .gemini
         } else {
             family = .unknown
@@ -942,6 +994,30 @@ nonisolated enum AntigravityUsageFetcher {
             sanitized.detail = nil
             return sanitized
         }
+    }
+
+    // 卡片要显示的额度行：有汇总数据就用汇总；汇总失败退回逐模型数据时，显示两个额度池的代表行和单独额度。
+    static func visibleWindows(windows: [UsageWindow], additionalWindows: [UsageWindow]) -> [UsageWindow] {
+        if additionalWindows.contains(where: { $0.id.hasPrefix("antigravity-quota-summary-") }) {
+            return visibleSummaryWindows(from: additionalWindows)
+        }
+        return windows + additionalWindows
+    }
+
+    // 汇总接口失败时卡片会变成逐模型数据，记下原因，方便查为什么变样。
+    // finishedAt 是汇总请求返回的时间，响应解析失败时耗时不算上后面的身份查询。
+    private static func logQuotaSummaryFailure(_ error: Error, source: String, startedAt: Date, finishedAt: Date?) {
+        guard !AppDelegate.isRunningTests else { return }
+        let summary = DiagnosticsErrorSummary(error: error)
+        let nsError = error as NSError
+        let elapsed = Int((finishedAt ?? Date()).timeIntervalSince(startedAt) * 1000)
+        let status = summary.httpStatus.map { " http=\($0)" } ?? ""
+        DiagnosticLog.shared.write(
+            "provider=antigravity quota_summary_failed source=\(source) elapsed_ms=\(elapsed) "
+                + "error=\(summary.kind) domain=\(nsError.domain) code=\(nsError.code)\(status) "
+                + "message=\(error.localizedDescription)",
+            category: .provider
+        )
     }
 
     private static func displayFamilyKey(_ window: UsageWindow) -> String {
@@ -1184,7 +1260,8 @@ nonisolated enum AntigravityUsageFetcher {
     private static func localRequest(
         path: String,
         body: [String: Any],
-        endpoint: LocalEndpoint
+        endpoint: LocalEndpoint,
+        timeout: TimeInterval = 2
     ) async throws -> Data {
         FetchDiagnostics.current?.beginStrategy("Local API")
         guard let url = URL(string: "\(endpoint.scheme)://127.0.0.1:\(endpoint.port)\(path)") else {
@@ -1192,7 +1269,7 @@ nonisolated enum AntigravityUsageFetcher {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 2
+        request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
         if !endpoint.token.isEmpty {
@@ -1209,8 +1286,8 @@ nonisolated enum AntigravityUsageFetcher {
 
     private static let localSession: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 3
-        configuration.timeoutIntervalForResource = 5
+        configuration.timeoutIntervalForRequest = quotaSummaryTimeout
+        configuration.timeoutIntervalForResource = quotaSummaryTimeout + 1
         configuration.waitsForConnectivity = false
         return URLSession(configuration: configuration, delegate: AntigravityLocalTrustDelegate(), delegateQueue: nil)
     }()

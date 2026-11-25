@@ -131,9 +131,89 @@ struct AntigravityUsageTests {
         let usage = try AntigravityUsageFetcher.parseModelResponse(data: data)
 
         #expect(usage.windows.map(\.usedFraction) == [0.7, 0.6])
-        #expect(usage.additionalWindows.map(\.id) == ["gemini-3-flash-lite", "gemini-3-pro-image"])
+        // Pro 和 Flash 比例不同，不是同一个池子：代表行取更紧的 Flash，Pro 单独列出。
+        #expect(usage.additionalWindows.map(\.id) == ["gemini-3-pro", "gemini-3-flash-lite", "gemini-3-pro-image"])
         #expect(usage.plan == "Ultra")
         #expect(usage.details.isEmpty)
+    }
+
+    @Test(arguments: [true, false])
+    func localGeminiFourAndOrchestratorRowsCollapseIntoGeminiPool(includesFlash: Bool) throws {
+        let flash = includesFlash
+            ? #"{"label":"Gemini 3.8 Flash (High)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M318"},"quotaInfo":{"remainingFraction":0.78782666,"resetTime":"2026-11-25T06:32:38Z"}},"#
+            : ""
+        let data = Data("""
+        {
+          "userStatus":{"cascadeModelConfigData":{"clientModelConfigs":[
+            {"label":"Gemini 4 Argon (High)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"},"quotaInfo":{"remainingFraction":0.78782666,"resetTime":"2026-11-25T06:32:38Z"}},
+            {"label":"Gemini 4 Neon (Low)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M534"},"quotaInfo":{"remainingFraction":0.78782666,"resetTime":"2026-11-25T06:32:38Z"}},
+            {"label":"Orchestrator (Argon)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M681"},"quotaInfo":{"remainingFraction":0.78782666,"resetTime":"2026-11-25T06:32:38Z"}},
+            \(flash)
+            {"label":"Claude Opus 5.5 (High)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M402"},"quotaInfo":{"remainingFraction":1,"resetTime":"2026-11-25T07:34:13Z"}},
+            {"label":"Claude Autocomplete","modelOrAlias":{"model":"claude-autocomplete"},"quotaInfo":{"remainingFraction":0.78782666,"resetTime":"2026-11-25T06:32:38Z"}}
+          ]}}
+        }
+        """.utf8)
+
+        let usage = try AntigravityUsageFetcher.parseModelResponse(data: data)
+
+        #expect(usage.windows.map(\.id) == ["antigravity-gemini", "antigravity-other"])
+        #expect(abs((usage.windows.first?.usedFraction ?? 0) - 0.21217334) < 0.000001)
+        // 同值但属于别的模型类型的独立额度照样保留。
+        #expect(usage.additionalWindows.map(\.id) == ["claude-autocomplete"])
+        #expect(AntigravityUsageFetcher.visibleWindows(
+            windows: usage.windows,
+            additionalWindows: usage.additionalWindows
+        ).map(\.id) == ["antigravity-gemini", "antigravity-other", "claude-autocomplete"])
+    }
+
+    @Test
+    func separateArgonAllowanceStaysOutOfSharedGeminiPool() throws {
+        let data = Data("""
+        {"userStatus":{"cascadeModelConfigData":{"clientModelConfigs":[
+          {"label":"Gemini 3.8 Flash (High)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M318"},"quotaInfo":{"remainingFraction":0.79,"resetTime":"2026-11-25T06:32:38Z"}},
+          {"label":"Gemini 4 Neon (High)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M532"},"quotaInfo":{"remainingFraction":0.79,"resetTime":"2026-11-25T06:32:38Z"}},
+          {"label":"Orchestrator (Neon)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M537"},"quotaInfo":{"remainingFraction":0.79,"resetTime":"2026-11-25T06:32:38Z"}},
+          {"label":"Gemini 4 Argon (High)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"},"quotaInfo":{"remainingFraction":0.4,"resetTime":"2026-11-28T00:00:00Z"}},
+          {"label":"Gemini 4 Argon (Low)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M419"},"quotaInfo":{"remainingFraction":0.4,"resetTime":"2026-11-28T00:00:00Z"}}
+        ]}}}
+        """.utf8)
+
+        let usage = try AntigravityUsageFetcher.parseModelResponse(data: data)
+
+        #expect(usage.windows.map(\.id) == ["antigravity-gemini"])
+        #expect(abs((usage.windows.first?.usedFraction ?? 0) - 0.21) < 0.000001)
+        #expect(usage.additionalWindows.map(\.label) == ["Gemini 4 Argon (High)", "Gemini 4 Argon (Low)"])
+    }
+
+    @Test
+    func geminiModelsWithoutResetTimeAreNotAssumedToSharePool() throws {
+        let data = Data("""
+        {"userStatus":{"cascadeModelConfigData":{"clientModelConfigs":[
+          {"label":"Gemini 4 Argon (High)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"},"quotaInfo":{"remainingFraction":0.4}},
+          {"label":"Gemini 4 Neon (High)","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M532"},"quotaInfo":{"remainingFraction":0.4}}
+        ]}}}
+        """.utf8)
+
+        let usage = try AntigravityUsageFetcher.parseModelResponse(data: data)
+
+        #expect(usage.windows.map(\.id) == ["antigravity-gemini"])
+        #expect(usage.additionalWindows.count == 1)
+    }
+
+    @Test
+    func unknownOnlyFallbackRepresentativeIsNotListedTwice() throws {
+        let data = Data("""
+        {"userStatus":{"cascadeModelConfigData":{"clientModelConfigs":[
+          {"label":"Nova Large","modelOrAlias":{"model":"MODEL_PLACEHOLDER_N1"},"quotaInfo":{"remainingFraction":0.4}},
+          {"label":"Nova Small","modelOrAlias":{"model":"MODEL_PLACEHOLDER_N2"},"quotaInfo":{"remainingFraction":0.7}}
+        ]}}}
+        """.utf8)
+
+        let usage = try AntigravityUsageFetcher.parseModelResponse(data: data)
+
+        #expect(usage.windows.map(\.id) == ["antigravity-fallback-MODEL_PLACEHOLDER_N1"])
+        #expect(usage.additionalWindows.map(\.id) == ["MODEL_PLACEHOLDER_N2"])
     }
 
     @Test
