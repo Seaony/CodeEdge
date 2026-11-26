@@ -1,13 +1,104 @@
 import Foundation
+import SweetCookieKit
 
 enum ClaudeWebUsageFetcher {
+    typealias CacheUpdate = @Sendable (String?) async -> Void
+
+    static let browserDomains = ["claude.ai"]
+
     static func fetch(
         cookie: String,
         organizationID: String,
         descriptor: ProviderDescriptor,
         session: URLSession
     ) async throws -> ProviderUsage {
-        let sessionKey = normalizedSessionKey(cookie)
+        try await fetch(
+            manualCookie: cookie,
+            cachedCookie: nil,
+            allowBrowserImport: false,
+            organizationID: organizationID,
+            descriptor: descriptor,
+            session: session
+        )
+    }
+
+    static func fetch(
+        manualCookie: String?,
+        cachedCookie: String?,
+        allowBrowserImport: Bool,
+        organizationID: String,
+        descriptor: ProviderDescriptor,
+        session: URLSession,
+        cacheUpdate: @escaping CacheUpdate = { _ in }
+    ) async throws -> ProviderUsage {
+        var candidates: [(sessionKey: String, cached: Bool)] = []
+        let manualKey = manualCookie.map(normalizedSessionKey) ?? ""
+        if !manualKey.isEmpty {
+            candidates.append((manualKey, false))
+        }
+        let cachedKey = cachedCookie.map(normalizedSessionKey) ?? ""
+        if !cachedKey.isEmpty, !candidates.contains(where: { $0.sessionKey == cachedKey }) {
+            candidates.append((cachedKey, true))
+        }
+        if manualKey.isEmpty, allowBrowserImport {
+            for imported in automaticSessionKeys() where !candidates.contains(where: { $0.sessionKey == imported }) {
+                candidates.append((imported, false))
+            }
+        }
+        guard !candidates.isEmpty else { throw UsageCollectionError.missingCredential }
+
+        var lastError: Error = UsageCollectionError.missingCredential
+        for candidate in candidates {
+            do {
+                let usage = try await fetchWithSessionKey(
+                    candidate.sessionKey,
+                    organizationID: organizationID,
+                    descriptor: descriptor,
+                    session: session
+                )
+                if manualKey.isEmpty { await cacheUpdate(candidate.sessionKey) }
+                return usage
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+                if candidate.cached,
+                   case UsageCollectionError.requestFailed(let status) = error,
+                   status == 401 || status == 403 {
+                    await cacheUpdate(nil)
+                }
+            }
+        }
+        throw lastError
+    }
+
+    static func automaticSessionKeys() -> [String] {
+        let query = BrowserCookieQuery(domains: browserDomains)
+        let client = BrowserCookieClient()
+        let preferred = [Browser.safari, Browser.chrome, Browser.firefox]
+        let order = preferred + Browser.defaultImportOrder.filter { !preferred.contains($0) }
+        var keys: [String] = []
+        for browser in order {
+            guard let stores = try? BrowserCookieAccess.records(matching: query, in: browser, client: client) else {
+                continue
+            }
+            for store in stores {
+                let cookies = BrowserCookieClient.makeHTTPCookies(store.records, origin: query.origin)
+                for cookie in cookies where cookie.name.caseInsensitiveCompare("sessionKey") == .orderedSame {
+                    let value = cookie.value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !value.isEmpty, !keys.contains(value) { keys.append(value) }
+                }
+            }
+        }
+        return keys
+    }
+
+    private static func fetchWithSessionKey(
+        _ sessionKey: String,
+        organizationID: String,
+        descriptor: ProviderDescriptor,
+        session: URLSession
+    ) async throws -> ProviderUsage {
         guard !sessionKey.isEmpty else { throw UsageCollectionError.missingCredential }
         let organizationsData = try await get(
             URL(string: "https://claude.ai/api/organizations")!,

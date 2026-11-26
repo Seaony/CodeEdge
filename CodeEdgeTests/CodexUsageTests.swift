@@ -372,6 +372,16 @@ struct CodexUsageTests {
         return URLSession(configuration: configuration)
     }
 
+    @Test
+    func resolvesBundledCodexCLIBinaryWhenPATHIsMinimal() {
+        let bundled = "/Applications/Codex.app/Contents/Resources/codex"
+        let resolved = CodexUsageFetcher.resolveCLIBinary(
+            environment: ["PATH": "/usr/bin:/bin", "HOME": "/tmp/nonexistent-home"],
+            isExecutable: { $0 == bundled }
+        )
+        #expect(resolved == bundled)
+    }
+
     private static func temporaryCodexHome() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("codeedge-codex-tests-\(UUID().uuidString)", isDirectory: true)

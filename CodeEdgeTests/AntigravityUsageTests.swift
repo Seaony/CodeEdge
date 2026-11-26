@@ -642,6 +642,89 @@ struct AntigravityUsageTests {
         ])
     }
 
+    @Test
+    func parsesAgyPrintUsageJSONReportAndIgnoresEpochZeroResetTimes() throws {
+        let data = Data("""
+        {
+          "conversation_id": "",
+          "status": "SUCCESS",
+          "command": {
+            "name": "usage",
+            "data": {
+              "groups": [
+                {
+                  "name": "Gemini Models",
+                  "buckets": [
+                    {"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.53,"reset_time":"2026-12-01T10:07:49Z"},
+                    {"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":0.27,"reset_time":"2026-11-26T05:13:45Z"}
+                  ]
+                },
+                {
+                  "name": "Claude and \(Self.otherAbbreviation) models",
+                  "buckets": [
+                    {"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1,"reset_time":"1970-01-01T00:00:00Z"},
+                    {"id":"3p-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":1,"reset_time":"1970-01-01T00:00:00Z"}
+                  ]
+                }
+              ]
+            }
+          }
+        }
+        """.utf8)
+
+        let usage = try AntigravityUsageFetcher.parseCLIUsageReport(data: data)
+
+        #expect(usage.state == .ready)
+        #expect(usage.additionalWindows.map(\.id) == [
+            "antigravity-quota-summary-gemini-5h",
+            "antigravity-quota-summary-gemini-weekly",
+            "antigravity-quota-summary-3p-5h",
+            "antigravity-quota-summary-3p-weekly",
+        ])
+        #expect(abs(usage.additionalWindows[0].usedFraction - 0.73) < 0.0001)
+        #expect(usage.additionalWindows[0].resetsAt != nil)
+        #expect(abs(usage.additionalWindows[1].usedFraction - 0.47) < 0.0001)
+        #expect(usage.additionalWindows[2].resetsAt == nil)
+        #expect(usage.additionalWindows[3].resetsAt == nil)
+    }
+
+    @Test
+    func parsesAgyVersionAndRunsPrintUsageScriptWithoutOpeningBrowser() async throws {
+        let parsed = try #require(AntigravityUsageFetcher.parseAgyVersion("1.5.17\n"))
+        #expect(parsed == (1, 5, 17))
+        let gated = try #require(AntigravityUsageFetcher.parseAgyVersion("1.2.2"))
+        #expect(gated == AntigravityUsageFetcher.firstCSRFGatedVersion)
+        #expect(AntigravityUsageFetcher.parseAgyVersion("dev-build") == nil)
+
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "codeedge-fake-agy-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = directory.appending(path: "agy")
+        try Data("""
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+          echo "1.5.17"
+          exit 0
+        fi
+        if [ "$AGY_CLI_DISABLE_AUTO_UPDATE" != "true" ] || [ -n "$ANTIGRAVITY_OAUTH_CREDENTIALS_JSON" ]; then
+          exit 2
+        fi
+        cat <<'JSON'
+        {"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","name":"Five Hour Limit","window":"5h","remaining_fraction":0.6,"reset_time":"2026-11-26T05:13:45Z"}]}]}}}
+        JSON
+        """.utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let usage = try await AntigravityUsageFetcher.fetchPrintUsage(
+            binary: script.path,
+            environment: ["ANTIGRAVITY_OAUTH_CREDENTIALS_JSON": "{\"access_token\":\"secret\"}"]
+        )
+
+        #expect(usage.additionalWindows.map(\.id) == ["antigravity-quota-summary-gemini-5h"])
+        #expect(abs((usage.additionalWindows.first?.usedFraction ?? 0) - 0.4) < 0.0001)
+    }
+
     private func stubSession(_ protocolClass: AnyClass) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [protocolClass]

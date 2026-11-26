@@ -119,7 +119,7 @@ actor UsageCollector: UsageCollecting {
             return await OpenCodeGoUsageFetcher.enrichWithBoundedLocalHistory(usage)
         }
         let claudeUsesAdminAPI = descriptor.id.rawValue == "claude"
-            && configuration.source == .token
+            && (configuration.source == .token || configuration.source == .automatic)
             && [secret, environmentSecret(for: descriptor)].contains { credential in
                 credential.trimmingCharacters(in: .whitespacesAndNewlines)
                     .lowercased().hasPrefix("sk-ant-admin")
@@ -356,7 +356,9 @@ actor UsageCollector: UsageCollecting {
             return try await claudeUsage(
                 descriptor: descriptor,
                 configuration: configuration,
-                secret: secret
+                secret: secret,
+                allowBrowserCookieImport: allowBrowserCookieImport,
+                usageRevision: usageRevision
             )
         }
         if descriptor.id.rawValue == "cursor", configuration.source == .cookie {
@@ -1256,17 +1258,70 @@ actor UsageCollector: UsageCollecting {
         return try UsageParser.parse(data, descriptor: descriptor)
     }
 
+    // 对齐 CodexBar：先请求带 cedar_ember=1 与 claude-cli UA，遇到 400 或非 user:profile 的 403 时退回旧路径和 UA。
+    nonisolated static func fetchClaudeOAuthUsage(
+        secret: String,
+        descriptor: ProviderDescriptor,
+        session: URLSession,
+        claudeVersion: String = "2.1.0"
+    ) async throws -> ProviderUsage {
+        let baseEndpoint = ProviderRecipes.recipe(for: descriptor.id)?.endpoint
+            ?? "https://api.anthropic.com/api/oauth/usage"
+        guard let primaryURL = URL(string: baseEndpoint + "?cedar_ember=1"),
+              let fallbackURL = URL(string: baseEndpoint)
+        else { throw UsageCollectionError.missingEndpoint }
+
+        let version = claudeVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "2.1.0" : claudeVersion
+        let codeUserAgent = "claude-code/\(version)"
+        let cliUserAgent = "claude-cli/\(version) (external, cli)"
+
+        func makeRequest(url: URL, userAgent: String) -> URLRequest {
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 30
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            return request
+        }
+
+        var (data, response) = try await session.data(for: makeRequest(url: primaryURL, userAgent: cliUserAgent))
+        guard var http = response as? HTTPURLResponse else { throw UsageCollectionError.unreadableResponse }
+        if http.statusCode == 400
+            || (http.statusCode == 403 && !(String(data: data, encoding: .utf8)?.contains("user:profile") ?? false)) {
+            try Task.checkCancellation()
+            (data, response) = try await session.data(for: makeRequest(url: fallbackURL, userAgent: codeUserAgent))
+            guard let retriedHTTP = response as? HTTPURLResponse else {
+                throw UsageCollectionError.unreadableResponse
+            }
+            http = retriedHTTP
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw UsageCollectionError.requestFailed(http.statusCode)
+        }
+        return try UsageParser.parse(data, descriptor: descriptor)
+    }
+
     private func claudeUsage(
         descriptor: ProviderDescriptor,
         configuration: ProviderConfiguration,
-        secret: String
+        secret: String,
+        allowBrowserCookieImport: Bool,
+        usageRevision: Int?
     ) async throws -> ProviderUsage {
         let environment = ProcessInfo.processInfo.environment
         let configured = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         let environmentCredential = environmentSecret(for: descriptor)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let adminCredential = [configured, environmentCredential]
+            .first { $0.lowercased().hasPrefix("sk-ant-admin") }
         let needsLocalCredential: Bool = switch configuration.source {
-        case .automatic, .account: !configured.lowercased().hasPrefix("sk-ant-oat")
+        case .automatic: adminCredential == nil && !configured.lowercased().hasPrefix("sk-ant-oat")
+        case .account: !configured.lowercased().hasPrefix("sk-ant-oat")
         case .token: configured.isEmpty && environmentCredential.isEmpty
         case .cookie, .command, .endpoint: false
         }
@@ -1280,6 +1335,10 @@ actor UsageCollector: UsageCollecting {
             .first { !$0.isEmpty }
         let webCredential = !configured.isEmpty
             && !configured.lowercased().hasPrefix("sk-ant-") ? configured : nil
+        let cachedCookie = await MainActor.run {
+            ProviderPreferences.shared.auxiliarySecret(for: descriptor.id, key: "imported-cookie")
+        }.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasWebSession = webCredential != nil || !cachedCookie.isEmpty || allowBrowserCookieImport
         let configuredBinary = configuration.command.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasCLI = ClaudeCLIUsageFetcher.resolveBinary(
             configuredBinary: configuredBinary.isEmpty ? nil : configuredBinary,
@@ -1290,11 +1349,15 @@ actor UsageCollector: UsageCollecting {
         let sources: [ClaudeUsageDataSource]
         switch configuration.source {
         case .automatic:
-            sources = ClaudeUsageSourcePlanner.automaticAppOrder(
-                hasOAuthCredentials: oauthCredential != nil,
-                hasCLI: hasCLI,
-                hasWebSession: webCredential != nil
-            )
+            if adminCredential != nil {
+                sources = [.adminAPI]
+            } else {
+                sources = ClaudeUsageSourcePlanner.automaticAppOrder(
+                    hasOAuthCredentials: oauthCredential != nil,
+                    hasCLI: hasCLI,
+                    hasWebSession: hasWebSession
+                )
+            }
         case .account:
             sources = ClaudeUsageSourcePlanner.explicitOAuthAppOrder(hasCLI: hasCLI)
         case .token:
@@ -1337,14 +1400,11 @@ actor UsageCollector: UsageCollecting {
                         ? tokenCredential
                         : oauthCredential
                     guard let credential else { throw UsageCollectionError.missingCredential }
-                    guard let recipe = ProviderRecipes.recipe(for: descriptor.id) else {
-                        throw UsageCollectionError.missingEndpoint
-                    }
                     do {
-                        return completed(try await remoteUsage(
+                        return completed(try await Self.fetchClaudeOAuthUsage(
+                            secret: credential,
                             descriptor: descriptor,
-                            recipe: recipe,
-                            secret: credential
+                            session: session
                         ))
                     } catch UsageCollectionError.requestFailed(401) {
                         guard credential == local,
@@ -1354,24 +1414,34 @@ actor UsageCollector: UsageCollecting {
                         guard !renewed.isEmpty, renewed != credential else {
                             throw UsageCollectionError.requestFailed(401)
                         }
-                        return completed(try await remoteUsage(
+                        return completed(try await Self.fetchClaudeOAuthUsage(
+                            secret: renewed,
                             descriptor: descriptor,
-                            recipe: recipe,
-                            secret: renewed
+                            session: session
                         ))
                     }
                 case .adminAPI:
-                    let credential = [configured, environmentCredential]
-                        .first { $0.lowercased().hasPrefix("sk-ant-admin") }
-                    guard let credential else { throw UsageCollectionError.missingCredential }
-                    return completed(try await ClaudeAdminAPIUsageFetcher.fetch(apiKey: credential, session: session))
+                    guard let adminCredential else { throw UsageCollectionError.missingCredential }
+                    return completed(try await ClaudeAdminAPIUsageFetcher.fetch(apiKey: adminCredential, session: session))
                 case .webAPI:
-                    guard let webCredential else { throw UsageCollectionError.missingCredential }
                     return completed(try await ClaudeWebUsageFetcher.fetch(
-                        cookie: webCredential,
+                        manualCookie: webCredential,
+                        cachedCookie: cachedCookie.isEmpty ? nil : cachedCookie,
+                        allowBrowserImport: allowBrowserCookieImport || configuration.source == .cookie,
                         organizationID: configuration.account,
                         descriptor: descriptor,
-                        session: session
+                        session: session,
+                        cacheUpdate: { value in
+                            await MainActor.run {
+                                try? ProviderPreferences.shared.setAuxiliarySecret(
+                                    value ?? "",
+                                    for: descriptor.id,
+                                    key: "imported-cookie",
+                                    invalidatesUsage: false,
+                                    expectedRevision: usageRevision
+                                )
+                            }
+                        }
                     ))
                 case .cli:
                     return completed(try await ClaudeCLIUsageFetcher.fetch(

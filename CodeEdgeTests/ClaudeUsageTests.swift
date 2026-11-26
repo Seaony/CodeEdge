@@ -756,4 +756,54 @@ struct ClaudeUsageTests {
             #expect(output.count == 200_000)
         }
     }
+
+    @Test
+    func claudeOAuthUsesCedarEmberAndFallsBackOn400() async throws {
+        final class Recorder: @unchecked Sendable {
+            private let lock = NSLock()
+            var requests: [URLRequest] = []
+            func append(_ request: URLRequest) { lock.withLock { requests.append(request) } }
+        }
+        final class ProtocolStub: URLProtocol {
+            nonisolated(unsafe) static var recorder: Recorder?
+            override class func canInit(with _: URLRequest) -> Bool { true }
+            override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+            override func startLoading() {
+                Self.recorder?.append(request)
+                let isPrimary = request.url?.query == "cedar_ember=1"
+                let status = isPrimary ? 400 : 200
+                let body = isPrimary
+                    ? Data(#"{"error":"unsupported"}"#.utf8)
+                    : Data(#"{"five_hour":{"utilization":25},"seven_day":{"utilization":40}}"#.utf8)
+                let response = HTTPURLResponse(
+                    url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil
+                )!
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: body)
+                client?.urlProtocolDidFinishLoading(self)
+            }
+            override func stopLoading() {}
+        }
+
+        let recorder = Recorder()
+        ProtocolStub.recorder = recorder
+        defer { ProtocolStub.recorder = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+
+        let usage = try await UsageCollector.fetchClaudeOAuthUsage(
+            secret: "sk-ant-oat-test",
+            descriptor: descriptor,
+            session: session,
+            claudeVersion: "2.1.5"
+        )
+
+        #expect(recorder.requests.count == 2)
+        #expect(recorder.requests[0].url?.absoluteString == "https://api.anthropic.com/api/oauth/usage?cedar_ember=1")
+        #expect(recorder.requests[0].value(forHTTPHeaderField: "User-Agent") == "claude-cli/2.1.5 (external, cli)")
+        #expect(recorder.requests[1].url?.absoluteString == "https://api.anthropic.com/api/oauth/usage")
+        #expect(recorder.requests[1].value(forHTTPHeaderField: "User-Agent") == "claude-code/2.1.5")
+        #expect(usage.windows.map(\.label) == ["Session", "Weekly"])
+    }
 }

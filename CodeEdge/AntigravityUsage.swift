@@ -199,6 +199,12 @@ nonisolated enum AntigravityUsageFetcher {
     private static let commandModelsPath =
         "/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs"
 
+    // agy 1.2.2 起本地端口也强制校验 CSRF Token 且不对外暴露，跳过无效轮询直接改走 print 模式。
+    static let firstCSRFGatedVersion: (UInt, UInt, UInt) = (1, 2, 2)
+    static let minimumPrintUsageVersion: (UInt, UInt, UInt) = (1, 1, 11)
+    private static let printUsageTimeout: TimeInterval = 60
+    private static let agyVersionCache = AgyVersionCache()
+
     static func fetch(
         credential rawCredential: String,
         source: ProviderSource,
@@ -208,17 +214,23 @@ nonisolated enum AntigravityUsageFetcher {
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) async throws -> ProviderUsage {
         if source != .token {
+            let expectedCredentials = try? resolvedCredentials(
+                rawCredential: rawCredential,
+                environment: environment,
+                homeDirectory: homeDirectory
+            )
+            let expectedEmail = expectedCredentials.flatMap { tokenClaims($0.idToken).email ?? clean($0.email) }
+            let hasExplicitOAuthTarget = clean(rawCredential) != nil
+                || clean(environment[credentialsEnvironmentKey]) != nil
+                || expectedEmail != nil
             do {
                 let local = try await fetchLocal(
                     environment: environment,
                     homeDirectory: homeDirectory,
-                    now: now
+                    now: now,
+                    allowPrintUsage: !hasExplicitOAuthTarget
                 )
-                if let expected = try? resolvedCredentials(
-                    rawCredential: rawCredential,
-                    environment: environment,
-                    homeDirectory: homeDirectory
-                ), let expectedEmail = tokenClaims(expected.idToken).email ?? clean(expected.email) {
+                if let expectedEmail {
                     let found = local.details.first(where: { $0.id == "account" })?.value
                     guard found?.caseInsensitiveCompare(expectedEmail) == .orderedSame else {
                         throw AntigravityUsageError.notLoggedIn
@@ -378,6 +390,18 @@ nonisolated enum AntigravityUsageFetcher {
         return makeModelUsage(models: models, identity: identity, sourceIsLocal: false, now: now)
     }
 
+    static func parseCLIUsageReport(data: Data, now: Date = Date()) throws -> ProviderUsage {
+        let root = try object(data)
+        guard clean(root["status"] as? String)?.uppercased() == "SUCCESS",
+              let command = dictionary(root["command"]),
+              clean(command["name"] as? String)?.lowercased() == "usage",
+              let payload = dictionary(command["data"])
+        else {
+            throw AntigravityUsageError.unreadableResponse("unsuccessful CLI usage report")
+        }
+        return try parseQuotaSummaryPayload(payload, identity: Identity(email: nil, plan: nil), now: now)
+    }
+
     static func parseQuotaSummary(
         data: Data,
         identityData: Data? = nil,
@@ -391,6 +415,22 @@ nonisolated enum AntigravityUsageFetcher {
         let payload = dictionary(root["response"])
             ?? dictionary(root["summary"])
             ?? root
+        let identity = suppliedIdentity
+            ?? identityData.flatMap { try? parseIdentity(data: $0) } ?? Identity(email: nil, plan: nil)
+        return try parseQuotaSummaryPayload(
+            payload,
+            identity: identity,
+            hasSuppliedIdentity: suppliedIdentity != nil,
+            now: now
+        )
+    }
+
+    private static func parseQuotaSummaryPayload(
+        _ payload: [String: Any],
+        identity initialIdentity: Identity,
+        hasSuppliedIdentity: Bool = false,
+        now: Date
+    ) throws -> ProviderUsage {
         guard let rawGroups = payload["groups"] as? [Any] else {
             throw AntigravityUsageError.unreadableResponse("missing quota groups")
         }
@@ -401,6 +441,7 @@ nonisolated enum AntigravityUsageFetcher {
         for (groupOrder, rawGroup) in rawGroups.enumerated() {
             guard let group = dictionary(rawGroup) else { continue }
             let rawGroupName = clean(group["displayName"] as? String)
+                ?? clean(group["display_name"] as? String)
                 ?? clean(group["name"] as? String) ?? "Quota"
             let family = quotaFamily(rawGroupName)
             // 带版本号的分组（如 Gemini 4 Argon）是单独的额度，保留原名，不并成 Gemini。
@@ -409,20 +450,26 @@ nonisolated enum AntigravityUsageFetcher {
             let buckets = group["buckets"] as? [Any] ?? []
             for (bucketOrder, rawBucket) in buckets.enumerated() {
                 guard let bucket = dictionary(rawBucket),
-                      let bucketID = clean(bucket["bucketId"] as? String) ?? clean(bucket["id"] as? String)
+                      let bucketID = clean(bucket["bucketId"] as? String)
+                        ?? clean(bucket["bucket_id"] as? String)
+                        ?? clean(bucket["id"] as? String)
                 else { continue }
                 let rawName = clean(bucket["displayName"] as? String)
+                    ?? clean(bucket["display_name"] as? String)
                     ?? clean(bucket["name"] as? String) ?? bucketID
                 let cadence = quotaCadence(
                     bucketID: bucketID, displayName: rawName, window: clean(bucket["window"] as? String)
                 )
+                let remainingDict = dictionary(bucket["remaining"])
                 let remaining = number(bucket["remainingFraction"])
-                    ?? number(dictionary(bucket["remaining"])?["remainingFraction"])
-                    ?? oneOfRemaining(dictionary(bucket["remaining"]))
+                    ?? number(bucket["remaining_fraction"])
+                    ?? number(remainingDict?["remainingFraction"])
+                    ?? number(remainingDict?["remaining_fraction"])
+                    ?? oneOfRemaining(remainingDict)
                 let disabled = bool(bucket["disabled"]) ?? false
                 guard !disabled, let remaining else { continue }
                 let fraction = min(max(1 - remaining, 0), 1)
-                let resetsAt = parseDate(bucket["resetTime"])
+                let resetsAt = parseDate(bucket["resetTime"] ?? bucket["reset_time"])
                 // 已有明确重置时间时，接口 description 只会重复英文倒计时文案；仅在缺少 resetTime 时保留。
                 let detail = resetsAt == nil ? clean(bucket["description"] as? String) : nil
                 windows.append((
@@ -452,10 +499,9 @@ nonisolated enum AntigravityUsageFetcher {
             throw AntigravityUsageError.unreadableResponse("missing quota buckets")
         }
 
-        var identity = suppliedIdentity
-            ?? identityData.flatMap { try? parseIdentity(data: $0) } ?? Identity(email: nil, plan: nil)
+        var identity = initialIdentity
         // 远程返回 Free 却带有付费才有的 5 小时额度时，说明套餐信息不可靠，不显示套餐名。
-        if suppliedIdentity != nil, identity.plan?.lowercased() == "free",
+        if hasSuppliedIdentity, identity.plan?.lowercased() == "free",
            windows.contains(where: { $0.cadenceRank == 0 }) {
             identity = Identity(email: identity.email, plan: nil)
         }
@@ -616,12 +662,31 @@ nonisolated enum AntigravityUsageFetcher {
     private static func fetchLocal(
         environment: [String: String],
         homeDirectory: URL,
-        now: Date
+        now: Date,
+        allowPrintUsage: Bool
     ) async throws -> ProviderUsage {
-        let processes = try localProcesses(homeDirectory: homeDirectory)
+        let processes = (try? localProcesses(homeDirectory: homeDirectory)) ?? []
         var lastError: Error = AntigravityUsageError.localServiceUnavailable
-        for kind in [LocalProcess.Kind.app, .command] {
-            for process in processes.filter({ $0.kind == kind }) {
+        for process in processes.filter({ $0.kind == .app }) {
+            do {
+                return try await fetchLocal(process: process, now: now)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+            }
+        }
+
+        let commandBinary = resolveCommandBinary(environment: environment)
+        let commandVersion: (UInt, UInt, UInt)? = if let commandBinary {
+            try? await agyVersion(binary: commandBinary, environment: environment)
+        } else {
+            nil
+        }
+        let skipTokenlessCLI = commandVersion.map { $0 >= firstCSRFGatedVersion } ?? false
+
+        if !skipTokenlessCLI {
+            for process in processes.filter({ $0.kind == .command }) {
                 do {
                     return try await fetchLocal(process: process, now: now)
                 } catch is CancellationError {
@@ -630,17 +695,31 @@ nonisolated enum AntigravityUsageFetcher {
                     lastError = error
                 }
             }
+            if processes.contains(where: { $0.kind == .command }) == false,
+               let commandBinary {
+                do {
+                    return try await fetchManagedCommand(binary: commandBinary, environment: environment, now: now)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    lastError = error
+                }
+            }
         }
-        if processes.contains(where: { $0.kind == .command }) == false,
-           let binary = resolveCommandBinary(environment: environment) {
+
+        if allowPrintUsage,
+           let commandBinary,
+           let commandVersion,
+           commandVersion >= minimumPrintUsageVersion {
             do {
-                return try await fetchManagedCommand(binary: binary, environment: environment, now: now)
+                return try await fetchPrintUsage(binary: commandBinary, environment: environment, now: now)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 lastError = error
             }
         }
+
         for process in processes.filter({ $0.kind == .ide }) {
             do {
                 return try await fetchLocal(process: process, now: now)
@@ -1601,12 +1680,246 @@ nonisolated enum AntigravityUsageFetcher {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
         return value
     }
+    static func parseAgyVersion(_ output: String) -> (UInt, UInt, UInt)? {
+        let version = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard version.range(of: #"^[0-9]+\.[0-9]+\.[0-9]+$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        let parts = version.split(separator: ".", omittingEmptySubsequences: false).compactMap { UInt($0) }
+        guard parts.count == 3 else { return nil }
+        return (parts[0], parts[1], parts[2])
+    }
+
+    static func agyVersion(
+        binary: String,
+        environment: [String: String]
+    ) async throws -> (UInt, UInt, UInt)? {
+        try await agyVersionCache.resolve(binary: binary) {
+            let output = try await runSubprocess(
+                binary: binary,
+                arguments: ["--version"],
+                environment: cliChildEnvironment(from: environment, stubDirectory: nil),
+                workingDirectory: nil,
+                timeout: 3,
+                maxOutputBytes: 4_096
+            )
+            return parseAgyVersion(String(decoding: output, as: UTF8.self))
+        }
+    }
+
+    static func fetchPrintUsage(
+        binary: String,
+        environment: [String: String],
+        now: Date = Date(),
+        timeout: TimeInterval = printUsageTimeout
+    ) async throws -> ProviderUsage {
+        FetchDiagnostics.current?.beginStrategy("CLI")
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "codeedge-agy-usage-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for command in ["open", "xdg-open"] {
+            guard FileManager.default.createFile(
+                atPath: directory.appending(path: command).path,
+                contents: Data("#!/bin/sh\nexit 1\n".utf8),
+                attributes: [.posixPermissions: 0o700]
+            ) else {
+                throw AntigravityUsageError.localServiceUnavailable
+            }
+        }
+        let launchEnvironment = cliChildEnvironment(from: environment, stubDirectory: directory)
+        let data = try await runSubprocess(
+            binary: binary,
+            arguments: ["-p", "/usage", "--output-format", "json", "--print-timeout", "\(Int(timeout))s"],
+            environment: launchEnvironment,
+            workingDirectory: directory,
+            timeout: timeout,
+            maxOutputBytes: 1_048_576
+        )
+        try Task.checkCancellation()
+        return try parseCLIUsageReport(data: data, now: now)
+    }
+
+    private static func cliChildEnvironment(
+        from environment: [String: String],
+        stubDirectory: URL?
+    ) -> [String: String] {
+        var result = environment
+        result.removeValue(forKey: credentialsEnvironmentKey)
+        // agy 只认 "true"，不认 "1"。
+        result["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
+        let basePath = clean(environment["PATH"])
+            ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        if let stubDirectory {
+            result["PATH"] = stubDirectory.path + ":" + basePath
+            result["BROWSER"] = stubDirectory.appending(path: "open").path
+        } else {
+            result["PATH"] = basePath
+        }
+        return result
+    }
+
+    private final class SubprocessCancellationState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func cancel() { lock.withLock { cancelled = true } }
+        func isCancelled() -> Bool { lock.withLock { cancelled } }
+    }
+
+    private final class SubprocessCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        private var closed = false
+        private(set) var overflowed = false
+        private let maxBytes: Int
+
+        init(maxBytes: Int) { self.maxBytes = maxBytes }
+
+        func appendAvailable(from handle: FileHandle) {
+            lock.withLock {
+                guard !closed else { return }
+                appendLocked(handle.availableData)
+            }
+        }
+
+        func close() { lock.withLock { closed = true } }
+
+        func append(_ chunk: Data) {
+            lock.withLock { appendLocked(chunk) }
+        }
+
+        private func appendLocked(_ chunk: Data) {
+            guard !chunk.isEmpty, !overflowed else { return }
+            if data.count + chunk.count > maxBytes {
+                overflowed = true
+                return
+            }
+            data.append(chunk)
+        }
+
+        func snapshot() -> (Data, Bool) {
+            lock.withLock { (data, overflowed) }
+        }
+    }
+
+    private static func runSubprocess(
+        binary: String,
+        arguments: [String],
+        environment: [String: String],
+        workingDirectory: URL?,
+        timeout: TimeInterval,
+        maxOutputBytes: Int
+    ) async throws -> Data {
+        let cancellation = SubprocessCancellationState()
+        let task = Task.detached(priority: .utility) { () throws -> Data in
+            let process = Process()
+            let output = Pipe()
+            process.executableURL = URL(fileURLWithPath: binary)
+            process.arguments = arguments
+            process.environment = environment
+            process.currentDirectoryURL = workingDirectory
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            let readHandle = output.fileHandleForReading
+            let capture = SubprocessCapture(maxBytes: maxOutputBytes)
+            readHandle.readabilityHandler = { capture.appendAvailable(from: $0) }
+            do {
+                try process.run()
+                _ = setpgid(process.processIdentifier, process.processIdentifier)
+            } catch {
+                readHandle.readabilityHandler = nil
+                throw AntigravityUsageError.localServiceUnavailable
+            }
+
+            let deadline = Date().addingTimeInterval(timeout)
+            var timedOut = false
+            while process.isRunning {
+                if cancellation.isCancelled() {
+                    terminateSubprocess(process)
+                    capture.close()
+                    readHandle.readabilityHandler = nil
+                    try? readHandle.close()
+                    throw CancellationError()
+                }
+                if capture.snapshot().1 {
+                    terminateSubprocess(process)
+                    capture.close()
+                    readHandle.readabilityHandler = nil
+                    try? readHandle.close()
+                    throw AntigravityUsageError.unreadableResponse("CLI output exceeded limit")
+                }
+                if Date() >= deadline {
+                    timedOut = true
+                    terminateSubprocess(process)
+                    break
+                }
+                usleep(50_000)
+            }
+            process.waitUntilExit()
+            usleep(20_000)
+            capture.close()
+            readHandle.readabilityHandler = nil
+            capture.append(drainNonBlocking(readHandle.fileDescriptor, maxBytes: maxOutputBytes))
+            try? readHandle.close()
+            let (data, overflowed) = capture.snapshot()
+            if cancellation.isCancelled() { throw CancellationError() }
+            if overflowed { throw AntigravityUsageError.unreadableResponse("CLI output exceeded limit") }
+            if timedOut || process.terminationStatus != 0 || data.isEmpty {
+                throw AntigravityUsageError.localServiceUnavailable
+            }
+            return data
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
+    private static func terminateSubprocess(_ process: Process) {
+        guard process.isRunning else { return }
+        let pid = process.processIdentifier
+        let group = getpgid(pid)
+        if group == pid, group > 0, group != getpgrp() {
+            _ = kill(-group, SIGTERM)
+        } else {
+            process.terminate()
+        }
+        let deadline = Date().addingTimeInterval(0.5)
+        while process.isRunning, Date() < deadline { usleep(20_000) }
+        if process.isRunning {
+            if group == pid, group > 0, group != getpgrp() { _ = kill(-group, SIGKILL) }
+            _ = kill(pid, SIGKILL)
+        }
+    }
+
+    private static func drainNonBlocking(_ descriptor: Int32, maxBytes: Int) -> Data {
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else { return Data() }
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        while result.count <= maxBytes {
+            let count = read(descriptor, &buffer, buffer.count)
+            guard count > 0 else { break }
+            result.append(buffer, count: count)
+        }
+        return result
+    }
+
     private static func parseDate(_ value: Any?) -> Date? {
-        if let seconds = number(value) { return Date(timeIntervalSince1970: seconds) }
+        if let seconds = number(value) {
+            return seconds > 0 ? Date(timeIntervalSince1970: seconds) : nil
+        }
         guard let text = clean(value as? String) else { return nil }
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: text) ?? ISO8601DateFormatter().date(from: text)
+        guard let date = fractional.date(from: text) ?? ISO8601DateFormatter().date(from: text),
+              date.timeIntervalSince1970 > 0 else { return nil }
+        return date
     }
     private static func codeValue(_ value: Any?) -> String? {
         if let value = value as? String { return value }
@@ -1619,6 +1932,36 @@ nonisolated enum AntigravityUsageFetcher {
     private static func unique<T: Hashable>(_ values: [T]) -> [T] {
         var seen = Set<T>()
         return values.filter { seen.insert($0).inserted }
+    }
+}
+
+private actor AgyVersionCache {
+    private struct ExecutableIdentity: Equatable {
+        let path: String
+        let modified: Date
+        let size: UInt64
+        let inode: UInt64
+    }
+
+    private var cached: (identity: ExecutableIdentity, version: (UInt, UInt, UInt))?
+
+    func resolve(
+        binary: String,
+        probe: @Sendable () async throws -> (UInt, UInt, UInt)?
+    ) async throws -> (UInt, UInt, UInt)? {
+        let path = URL(fileURLWithPath: binary).resolvingSymlinksInPath().path
+        guard FileManager.default.isExecutableFile(atPath: path),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let modified = attributes[.modificationDate] as? Date,
+              let size = (attributes[.size] as? NSNumber)?.uint64Value,
+              let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
+        else { return try await probe() }
+        let identity = ExecutableIdentity(path: path, modified: modified, size: size, inode: inode)
+        if let cached, cached.identity == identity { return cached.version }
+        let version = try await probe()
+        try Task.checkCancellation()
+        if let version { cached = (identity, version) }
+        return version
     }
 }
 

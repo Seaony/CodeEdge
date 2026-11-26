@@ -350,7 +350,7 @@ nonisolated enum CodexUsageFetcher {
         environment: [String: String],
         now: Date = Date()
     ) async throws -> ProviderUsage {
-        let auth = try CodexAuthStore.load(environment: environment)
+        let auth = try await loadOAuthSnapshot(environment: environment, now: now)
         guard let token = auth.oauthToken else { throw CodexUsageError.missingOAuthCredential }
         if auth.oauthNeedsRefresh(now: now) { throw CodexUsageError.oauthRefreshRequired }
         var request = URLRequest(
@@ -368,6 +368,27 @@ nonisolated enum CodexUsageFetcher {
         usage.codexResetCredits = try await fetchResetCredits(
             auth: auth, session: session, environment: environment, now: now)
         return usage
+    }
+
+    // 对齐 CodexBar：Codex CLI 可能正在原子改写 auth.json，遇到缺失或待刷新状态时短暂重读两次。
+    private static func loadOAuthSnapshot(
+        environment: [String: String],
+        now: Date
+    ) async throws -> CodexAuthSnapshot {
+        var retriesRemaining = 2
+        while true {
+            try Task.checkCancellation()
+            do {
+                let auth = try CodexAuthStore.load(environment: environment)
+                if !auth.oauthNeedsRefresh(now: now) || retriesRemaining == 0 {
+                    return auth
+                }
+            } catch {
+                guard retriesRemaining > 0 else { throw error }
+            }
+            retriesRemaining -= 1
+            try await Task.sleep(for: .milliseconds(50))
+        }
     }
 
     private struct ResetCreditsResponse: Decodable {
@@ -697,6 +718,42 @@ nonisolated enum CodexUsageFetcher {
         (windows.first { $0.label == "Weekly" } ?? windows.first { $0.label == "30-day" }).map { [$0] } ?? []
     }
 
+    static func resolveCLIBinary(
+        environment: [String: String],
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+    ) -> String? {
+        if let explicit = environment["CODEX_CLI_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicit.isEmpty {
+            return isExecutable(explicit) ? explicit : nil
+        }
+        let pathValue = cleaned(environment["PATH"])
+            ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        for directory in pathValue.split(separator: ":") {
+            let candidate = URL(fileURLWithPath: String(directory), isDirectory: true)
+                .appendingPathComponent("codex").path
+            if isExecutable(candidate) { return candidate }
+        }
+        let home = cleaned(environment["HOME"])
+            .map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath, isDirectory: true) }
+            ?? homeDirectory
+        let fallbacks = [
+            home.appendingPathComponent(".local/bin/codex").path,
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+            home.appendingPathComponent(".npm-global/bin/codex").path,
+            home.appendingPathComponent(".volta/bin/codex").path,
+            home.appendingPathComponent(".bun/bin/codex").path,
+            home.appendingPathComponent("Applications/ChatGPT.app/Contents/Resources/codex").path,
+            home.appendingPathComponent("Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex").path,
+            home.appendingPathComponent("Applications/Codex.app/Contents/Resources/codex").path,
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+            "/Applications/Codex.app/Contents/Resources/codex",
+        ]
+        return fallbacks.first(where: isExecutable)
+    }
+
     private static func displayPlan(_ raw: String) -> String? {
         UsageParser.displayPlan(raw, descriptor: descriptor)
     }
@@ -875,18 +932,7 @@ private nonisolated final class CodexRPCUsageClient: @unchecked Sendable {
     }
 
     private static func resolveBinary(environment: [String: String]) -> String? {
-        if let explicit = environment["CODEX_CLI_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !explicit.isEmpty, FileManager.default.isExecutableFile(atPath: explicit) {
-            return explicit
-        }
-        let paths = (environment["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-            .split(separator: ":")
-        for directory in paths {
-            let candidate = URL(fileURLWithPath: String(directory), isDirectory: true)
-                .appendingPathComponent("codex").path
-            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
-        }
-        return nil
+        CodexUsageFetcher.resolveCLIBinary(environment: environment)
     }
 
     private func number(_ value: Any?) -> Int? {
