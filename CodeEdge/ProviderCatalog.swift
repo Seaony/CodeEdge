@@ -31,7 +31,7 @@ enum ProviderCatalog {
         item("factory", "Droid", "Standard", "Premium", .quota, [.token, .cookie], ["FACTORY_API_KEY"], "gearshape.2", 0.22),
         item("fireworks", "Fireworks", "Spend", "Spend", .spend, [.token], ["FIREWORKS_API_KEY", "FIREWORKS_KEY"], "sparkles", 0.01),
         item("gemini", "Gemini", "Pro", "Flash", .quota, [.account, .cookie], ["GEMINI_OAUTH_CLIENT_ID", "GEMINI_OAUTH_CLIENT_SECRET", "GEMINI_OAUTH2_JS_PATH"], "diamond", 0.23),
-        item("antigravity", "Antigravity", "Gemini Models", "Claude and " + letterPair, .quota, [.account, .token], ["ANTIGRAVITY_OAUTH_CREDENTIALS_JSON"], "arrow.up.circle", 0.25),
+        item("antigravity", "Antigravity", "Gemini Models", "Claude and " + letterPair, .quota, [.account], [], "arrow.up.circle", 0.25),
         item("copilot", "Copilot", "Premium", "Chat", .quota, [.token], ["COPILOT_API_TOKEN"], "point.topleft.down.to.point.bottomright.curvepath", 0.27),
         item("devin", "Devin", "Daily", "Weekly", .quota, [.account, .token], ["DEVIN_BEARER_TOKEN", "DEVIN_AUTHORIZATION"], "d.circle", 0.29),
         item("zai", "z." + lowerLetterPair + " / GLM", "5-hour", "Weekly", .quota, [.token], ["Z" + letterPair + "_API_KEY"], "z.circle", 0.31),

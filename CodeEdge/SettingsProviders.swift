@@ -264,6 +264,10 @@ private struct ProviderConfigurationView: View {
            configuration.source == .account || configuration.source == .token {
             configuration.source = .automatic
         }
+        // Antigravity 已不再用 OAuth 凭据直连，旧的「访问令牌」来源退回自动检测。
+        if descriptor.id.rawValue == "antigravity", configuration.source == .token {
+            configuration.source = .automatic
+        }
         _configuration = State(initialValue: configuration)
         _secret = State(initialValue: secret)
         _managementSecret = State(initialValue: providerID == "openrouter"
@@ -820,9 +824,6 @@ private struct ProviderConfigurationView: View {
             default: copy.text("Codex PAT（可选）", "Codex PAT (optional)")
             }
         }
-        if descriptor.id.rawValue == "antigravity" {
-            return copy.text("OAuth 凭证 JSON（可选）", "OAuth credentials JSON (optional)")
-        }
         if descriptor.id.rawValue == "t3chat", configuration.source == .cookie {
             return copy.text("Cookie 或完整 cURL", "Cookie or full cURL")
         }
@@ -1110,6 +1111,7 @@ private struct ProviderConfigurationView: View {
     private var showsAuthenticationCard: Bool {
         if descriptor.id.rawValue == "coderabbit" { return false }
         if descriptor.id.rawValue == "pi" { return false }
+        if descriptor.id.rawValue == "antigravity" { return false }
         if descriptor.id.rawValue == "helmcode" { return configuration.source == .cookie }
         if descriptor.id.rawValue == "zed" { return configuration.source == .cookie }
         if descriptor.id.rawValue == "gemini" { return configuration.source == .cookie }

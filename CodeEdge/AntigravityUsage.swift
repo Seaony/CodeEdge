@@ -4,34 +4,16 @@ import Foundation
 import Security
 
 nonisolated enum AntigravityUsageError: LocalizedError, Equatable {
-    case notLoggedIn
-    case reauthenticationRequired
     case localServiceUnavailable
-    case permissionDenied(String)
     case requestFailed(Int)
     case unreadableResponse(String)
 
     var errorDescription: String? {
         switch self {
-        case .notLoggedIn:
-            AppLocalization.text(
-                "未找到 Antigravity 登录信息，请先在 Antigravity 中登录",
-                "Antigravity sign-in was not found. Sign in with Antigravity first."
-            )
-        case .reauthenticationRequired:
-            AppLocalization.text(
-                "当前 Antigravity 登录方式无法读取额度，请重新登录此账号",
-                "This Antigravity sign-in cannot read its quota. Sign in to this account again."
-            )
         case .localServiceUnavailable:
             AppLocalization.text(
                 "未找到可用的 Antigravity 本地额度服务",
                 "No available Antigravity local quota service was found."
-            )
-        case let .permissionDenied(message):
-            AppLocalization.text(
-                "Antigravity 额度接口拒绝访问：\(message)",
-                "Antigravity quota access was denied: \(message)"
             )
         case let .requestFailed(status):
             AppLocalization.text(
@@ -44,93 +26,6 @@ nonisolated enum AntigravityUsageError: LocalizedError, Equatable {
                 "Could not parse Antigravity usage: \(message)"
             )
         }
-    }
-}
-
-nonisolated struct AntigravityOAuthCredentials: Codable, Equatable, Sendable {
-    var accessToken: String?
-    var refreshToken: String?
-    var expiryMilliseconds: Double?
-    var idToken: String?
-    var email: String?
-    var projectID: String?
-    var clientID: String?
-    var clientSecret: String?
-
-    var expiryDate: Date? {
-        expiryMilliseconds.map { Date(timeIntervalSince1970: $0 / 1_000) }
-    }
-
-    init(
-        accessToken: String?,
-        refreshToken: String?,
-        expiryDate: Date?,
-        idToken: String? = nil,
-        email: String? = nil,
-        projectID: String? = nil,
-        clientID: String? = nil,
-        clientSecret: String? = nil
-    ) {
-        self.accessToken = accessToken
-        self.refreshToken = refreshToken
-        expiryMilliseconds = expiryDate.map { $0.timeIntervalSince1970 * 1_000 }
-        self.idToken = idToken
-        self.email = email
-        self.projectID = projectID
-        self.clientID = clientID
-        self.clientSecret = clientSecret
-    }
-
-    init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        accessToken = try values.decodeIfPresent(String.self, forKey: .accessTokenSnake)
-            ?? values.decodeIfPresent(String.self, forKey: .accessTokenCamel)
-        refreshToken = try values.decodeIfPresent(String.self, forKey: .refreshTokenSnake)
-            ?? values.decodeIfPresent(String.self, forKey: .refreshTokenCamel)
-        idToken = try values.decodeIfPresent(String.self, forKey: .idTokenSnake)
-            ?? values.decodeIfPresent(String.self, forKey: .idTokenCamel)
-        email = try values.decodeIfPresent(String.self, forKey: .email)
-        projectID = try values.decodeIfPresent(String.self, forKey: .projectIDSnake)
-            ?? values.decodeIfPresent(String.self, forKey: .projectIDCamel)
-        clientID = try values.decodeIfPresent(String.self, forKey: .clientIDSnake)
-            ?? values.decodeIfPresent(String.self, forKey: .clientIDCamel)
-        clientSecret = try values.decodeIfPresent(String.self, forKey: .clientSecretSnake)
-            ?? values.decodeIfPresent(String.self, forKey: .clientSecretCamel)
-        let snakeDouble = try? values.decodeIfPresent(Double.self, forKey: .expiryDateSnake)
-        let camelDouble = try? values.decodeIfPresent(Double.self, forKey: .expiresAtCamel)
-        let snakeInt = try? values.decodeIfPresent(Int.self, forKey: .expiryDateSnake)
-        let camelInt = try? values.decodeIfPresent(Int.self, forKey: .expiresAtCamel)
-        expiryMilliseconds = snakeDouble ?? camelDouble ?? snakeInt.map(Double.init) ?? camelInt.map(Double.init)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var values = encoder.container(keyedBy: CodingKeys.self)
-        try values.encodeIfPresent(accessToken, forKey: .accessTokenSnake)
-        try values.encodeIfPresent(refreshToken, forKey: .refreshTokenSnake)
-        try values.encodeIfPresent(expiryMilliseconds, forKey: .expiryDateSnake)
-        try values.encodeIfPresent(idToken, forKey: .idTokenSnake)
-        try values.encodeIfPresent(email, forKey: .email)
-        try values.encodeIfPresent(projectID, forKey: .projectIDSnake)
-        try values.encodeIfPresent(clientID, forKey: .clientIDSnake)
-        try values.encodeIfPresent(clientSecret, forKey: .clientSecretSnake)
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case accessTokenSnake = "access_token"
-        case accessTokenCamel = "accessToken"
-        case refreshTokenSnake = "refresh_token"
-        case refreshTokenCamel = "refreshToken"
-        case expiryDateSnake = "expiry_date"
-        case expiresAtCamel = "expiresAt"
-        case idTokenSnake = "id_token"
-        case idTokenCamel = "idToken"
-        case email
-        case projectIDSnake = "project_id"
-        case projectIDCamel = "projectId"
-        case clientIDSnake = "client_id"
-        case clientIDCamel = "clientId"
-        case clientSecretSnake = "client_secret"
-        case clientSecretCamel = "clientSecret"
     }
 }
 
@@ -177,18 +72,8 @@ nonisolated enum AntigravityUsageFetcher {
         var httpPort: Int?
     }
 
-    private static let baseURL = "https://cloudcode-pa.googleapis.com"
-    // 当前额度汇总只在 daily 主机上是最新的，其余请求仍走稳定主机。
-    private static let dailyBaseURL = "https://daily-cloudcode-pa.googleapis.com"
-    private static let loadCodeAssistPath = "/v1internal:loadCodeAssist"
-    private static let onboardUserPath = "/v1internal:onboardUser"
-    private static let availableModelsPath = "/v1internal:fetchAvailableModels"
-    private static let userQuotaPath = "/v1internal:retrieveUserQuota"
-    private static let userQuotaSummaryPath = "/v1internal:retrieveUserQuotaSummary"
-    private static let tokenURL = URL(string: "https://oauth2.googleapis.com/token")!
     // 汇总接口会现场去问 Google，实测 0.5～2.3 秒；超时就退回逐模型数据，没有周额度，所以多给些时间。
     private static let quotaSummaryTimeout: TimeInterval = 5
-    private static let credentialsEnvironmentKey = "ANTIGRAVITY_OAUTH_CREDENTIALS_JSON"
     private static let otherFamilyAbbreviation = String(UnicodeScalar(71)!)
         + String(UnicodeScalar(80)!) + String(UnicodeScalar(84)!)
     private static let otherVendorName = "open" + String(UnicodeScalar(97)!) + String(UnicodeScalar(105)!)
@@ -205,191 +90,6 @@ nonisolated enum AntigravityUsageFetcher {
     private static let printUsageTimeout: TimeInterval = 60
     private static let agyVersionCache = AgyVersionCache()
 
-    static func fetch(
-        credential rawCredential: String,
-        source: ProviderSource,
-        session: URLSession,
-        now: Date = Date(),
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
-    ) async throws -> ProviderUsage {
-        if source != .token {
-            let expectedCredentials = try? resolvedCredentials(
-                rawCredential: rawCredential,
-                environment: environment,
-                homeDirectory: homeDirectory
-            )
-            let expectedEmail = expectedCredentials.flatMap { tokenClaims($0.idToken).email ?? clean($0.email) }
-            let hasExplicitOAuthTarget = clean(rawCredential) != nil
-                || clean(environment[credentialsEnvironmentKey]) != nil
-                || expectedEmail != nil
-            do {
-                let local = try await fetchLocal(
-                    environment: environment,
-                    homeDirectory: homeDirectory,
-                    now: now,
-                    allowPrintUsage: !hasExplicitOAuthTarget
-                )
-                if let expectedEmail {
-                    let found = local.details.first(where: { $0.id == "account" })?.value
-                    guard found?.caseInsensitiveCompare(expectedEmail) == .orderedSame else {
-                        throw AntigravityUsageError.notLoggedIn
-                    }
-                }
-                return local
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                // Automatic account mode continues through the authoritative source order.
-            }
-        }
-
-        do {
-            return try await fetchRemote(
-                credential: rawCredential,
-                session: session,
-                now: now,
-                environment: environment,
-                homeDirectory: homeDirectory
-            )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch AntigravityUsageError.notLoggedIn where source != .token {
-            throw AntigravityUsageError.localServiceUnavailable
-        }
-    }
-
-    static func fetchRemote(
-        credential rawCredential: String,
-        session: URLSession,
-        now: Date = Date(),
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
-    ) async throws -> ProviderUsage {
-        FetchDiagnostics.current?.beginStrategy("OAuth")
-        var credentials = try resolvedCredentials(
-            rawCredential: rawCredential,
-            environment: environment,
-            homeDirectory: homeDirectory
-        )
-        guard clean(credentials.accessToken) != nil else { throw AntigravityUsageError.notLoggedIn }
-        if credentials.expiryDate.map({ $0.timeIntervalSince(now) <= 60 }) == true {
-            credentials = try await refresh(
-                credentials: credentials,
-                session: session,
-                now: now,
-                environment: environment
-            )
-            try persist(credentials: credentials, rawCredential: rawCredential, homeDirectory: homeDirectory)
-        }
-        guard let accessToken = clean(credentials.accessToken) else {
-            throw AntigravityUsageError.notLoggedIn
-        }
-
-        let codeAssist = try await requestJSON(
-            path: loadCodeAssistPath,
-            accessToken: accessToken,
-            body: ["metadata": remoteMetadata],
-            session: session
-        )
-        if clean(credentials.projectID) == nil, codeAssist["currentTier"] == nil,
-           Self.projectID(codeAssist) == nil,
-           (codeAssist["ineligibleTiers"] as? [[String: Any]])?.contains(where: {
-               $0["reasonCode"] as? String == "GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT"
-           }) == true {
-            throw AntigravityUsageError.reauthenticationRequired
-        }
-        let projectID = try await resolvedProjectID(
-            credentials: &credentials,
-            codeAssist: codeAssist,
-            accessToken: accessToken,
-            session: session
-        )
-        try persist(credentials: credentials, rawCredential: rawCredential, homeDirectory: homeDirectory)
-
-        let modelBody: [String: Any] = projectID.map { ["project": $0] } ?? [:]
-        let claims = tokenClaims(credentials.idToken)
-        let identity = Identity(
-            email: claims.email ?? clean(credentials.email),
-            plan: plan(codeAssist: codeAssist, hostedDomain: claims.hostedDomain)
-        )
-        let summaryStartedAt = Date()
-        do {
-            let summary = try await requestJSON(
-                path: userQuotaSummaryPath,
-                accessToken: accessToken,
-                body: modelBody,
-                session: session,
-                timeout: quotaSummaryTimeout,
-                host: dailyBaseURL
-            )
-            try Task.checkCancellation()
-            return try parseQuotaSummary(
-                data: JSONSerialization.data(withJSONObject: summary),
-                identity: identity,
-                now: now
-            )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch let error as URLError where error.code == .cancelled {
-            throw error
-        } catch AntigravityUsageError.notLoggedIn {
-            throw AntigravityUsageError.notLoggedIn
-        } catch {
-            try Task.checkCancellation()
-            logQuotaSummaryFailure(error, source: "OAuth", startedAt: summaryStartedAt, finishedAt: nil)
-        }
-        let models: [ModelQuota]
-        do {
-            let available = try await requestJSON(
-                path: availableModelsPath,
-                accessToken: accessToken,
-                body: modelBody,
-                session: session
-            )
-            let parsed = parseAvailableModels(available)
-            if shouldVerifyAvailableModels(parsed) {
-                do {
-                    let quota = try await requestJSON(
-                        path: userQuotaPath,
-                        accessToken: accessToken,
-                        body: modelBody,
-                        session: session
-                    )
-                    let verified = try parseQuotaBuckets(quota)
-                    models = verified.contains(where: { $0.remainingFraction != nil })
-                        ? merge(models: parsed, verified: verified)
-                        : []
-                } catch AntigravityUsageError.permissionDenied {
-                    models = []
-                }
-            } else {
-                models = parsed
-            }
-        } catch AntigravityUsageError.permissionDenied {
-            do {
-                let quota = try await requestJSON(
-                    path: userQuotaPath,
-                    accessToken: accessToken,
-                    body: modelBody,
-                    session: session
-                )
-                models = try parseQuotaBuckets(quota)
-            } catch AntigravityUsageError.permissionDenied {
-                models = []
-            }
-        }
-
-        if !models.contains(where: { $0.remainingFraction != nil }) {
-            return ProviderUsage(
-                id: ProviderID(rawValue: "antigravity"), state: .unavailable, windows: [],
-                balance: nil, plan: identity.plan, details: [], updatedAt: now,
-                message: AppLocalization.text("当前账号未提供额度数据", "Limits not available")
-            )
-        }
-        return makeModelUsage(models: models, identity: identity, sourceIsLocal: false, now: now)
-    }
-
     static func parseCLIUsageReport(data: Data, now: Date = Date()) throws -> ProviderUsage {
         let root = try object(data)
         guard clean(root["status"] as? String)?.uppercased() == "SUCCESS",
@@ -405,7 +105,6 @@ nonisolated enum AntigravityUsageFetcher {
     static func parseQuotaSummary(
         data: Data,
         identityData: Data? = nil,
-        identity suppliedIdentity: Identity? = nil,
         now: Date = Date()
     ) throws -> ProviderUsage {
         let root = try object(data)
@@ -415,20 +114,13 @@ nonisolated enum AntigravityUsageFetcher {
         let payload = dictionary(root["response"])
             ?? dictionary(root["summary"])
             ?? root
-        let identity = suppliedIdentity
-            ?? identityData.flatMap { try? parseIdentity(data: $0) } ?? Identity(email: nil, plan: nil)
-        return try parseQuotaSummaryPayload(
-            payload,
-            identity: identity,
-            hasSuppliedIdentity: suppliedIdentity != nil,
-            now: now
-        )
+        let identity = identityData.flatMap { try? parseIdentity(data: $0) } ?? Identity(email: nil, plan: nil)
+        return try parseQuotaSummaryPayload(payload, identity: identity, now: now)
     }
 
     private static func parseQuotaSummaryPayload(
         _ payload: [String: Any],
-        identity initialIdentity: Identity,
-        hasSuppliedIdentity: Bool = false,
+        identity: Identity,
         now: Date
     ) throws -> ProviderUsage {
         guard let rawGroups = payload["groups"] as? [Any] else {
@@ -499,12 +191,6 @@ nonisolated enum AntigravityUsageFetcher {
             throw AntigravityUsageError.unreadableResponse("missing quota buckets")
         }
 
-        var identity = initialIdentity
-        // 远程返回 Free 却带有付费才有的 5 小时额度时，说明套餐信息不可靠，不显示套餐名。
-        if hasSuppliedIdentity, identity.plan?.lowercased() == "free",
-           windows.contains(where: { $0.cadenceRank == 0 }) {
-            identity = Identity(email: identity.email, plan: nil)
-        }
         let families = Dictionary(grouping: detailed, by: familyKey)
         let core = ["gemini", "other"].compactMap { key -> UsageWindow? in
             guard let familyWindows = families[key], !familyWindows.isEmpty else { return nil }
@@ -550,7 +236,6 @@ nonisolated enum AntigravityUsageFetcher {
     static func parseModelResponse(
         data: Data,
         identity: Identity = Identity(email: nil, plan: nil),
-        sourceIsLocal: Bool = true,
         now: Date = Date()
     ) throws -> ProviderUsage {
         let root = try object(data)
@@ -566,104 +251,15 @@ nonisolated enum AntigravityUsageFetcher {
             throw AntigravityUsageError.unreadableResponse("missing quota models")
         }
         let parsedIdentity = status == nil ? identity : (try? parseIdentity(data: data)) ?? identity
-        return makeModelUsage(models: models, identity: parsedIdentity, sourceIsLocal: sourceIsLocal, now: now)
+        return makeModelUsage(models: models, identity: parsedIdentity, now: now)
     }
 
-    static func parseAvailableModels(_ root: [String: Any]) -> [ModelQuota] {
-        guard let models = dictionary(root["models"]) else { return [] }
-        return models.keys.sorted().compactMap { modelID in
-            guard let model = dictionary(models[modelID]), let quota = dictionary(model["quotaInfo"]) else {
-                return nil
-            }
-            return ModelQuota(
-                label: clean(model["displayName"] as? String)
-                    ?? clean(model["label"] as? String) ?? modelID,
-                modelID: modelID,
-                remainingFraction: number(quota["remainingFraction"]),
-                resetsAt: parseDate(quota["resetTime"]),
-                resetDescription: nil
-            )
-        }
-    }
-
-    static func parseQuotaBuckets(_ root: [String: Any]) throws -> [ModelQuota] {
-        guard let buckets = root["buckets"] as? [Any] else {
-            throw AntigravityUsageError.unreadableResponse("missing quota buckets")
-        }
-        var lowest: [String: ModelQuota] = [:]
-        for raw in buckets {
-            guard let bucket = dictionary(raw), let modelID = clean(bucket["modelId"] as? String) else { continue }
-            let next = ModelQuota(
-                label: modelID,
-                modelID: modelID,
-                remainingFraction: number(bucket["remainingFraction"]),
-                resetsAt: parseDate(bucket["resetTime"]),
-                resetDescription: nil
-            )
-            if let current = lowest[modelID],
-               (current.remainingFraction ?? .greatestFiniteMagnitude)
-                <= (next.remainingFraction ?? .greatestFiniteMagnitude) { continue }
-            lowest[modelID] = next
-        }
-        return lowest.keys.sorted().compactMap { lowest[$0] }
-    }
-
-    static func shouldVerifyAvailableModels(_ models: [ModelQuota]) -> Bool {
-        !models.isEmpty && models.allSatisfy { ($0.remainingFraction ?? -1) >= 0.999 }
-    }
-
-    static func merge(models: [ModelQuota], verified: [ModelQuota]) -> [ModelQuota] {
-        var verifiedByID = Dictionary(uniqueKeysWithValues: verified.map { ($0.modelID.lowercased(), $0) })
-        var output = models.compactMap { model -> ModelQuota? in
-            guard let match = verifiedByID.removeValue(forKey: model.modelID.lowercased()) else { return nil }
-            return ModelQuota(
-                label: model.label,
-                modelID: model.modelID,
-                remainingFraction: match.remainingFraction ?? model.remainingFraction,
-                resetsAt: match.resetsAt ?? model.resetsAt,
-                resetDescription: match.resetDescription ?? model.resetDescription
-            )
-        }
-        output += verifiedByID.values.filter { $0.remainingFraction != nil }
-            .sorted { $0.modelID.localizedCaseInsensitiveCompare($1.modelID) == .orderedAscending }
-        return output
-    }
-
-    static func tokenClaims(_ token: String?) -> (email: String?, hostedDomain: String?) {
-        guard let token, token.split(separator: ".").count >= 2 else { return (nil, nil) }
-        var payload = String(token.split(separator: ".")[1])
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
-        guard let data = Data(base64Encoded: payload, options: .ignoreUnknownCharacters),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return (nil, nil) }
-        return (clean(json["email"] as? String), clean(json["hd"] as? String))
-    }
-
-    static func resolvedCredentials(
-        rawCredential: String,
-        environment: [String: String],
-        homeDirectory: URL
-    ) throws -> AntigravityOAuthCredentials {
-        for candidate in [rawCredential, environment[credentialsEnvironmentKey] ?? ""] {
-            guard let value = clean(candidate), let data = value.data(using: .utf8),
-                  let credentials = try? JSONDecoder().decode(AntigravityOAuthCredentials.self, from: data)
-            else { continue }
-            return credentials
-        }
-        let file = homeDirectory.appending(path: ".codexbar/antigravity/oauth_creds.json")
-        guard let data = try? Data(contentsOf: file),
-              let credentials = try? JSONDecoder().decode(AntigravityOAuthCredentials.self, from: data)
-        else { throw AntigravityUsageError.notLoggedIn }
-        return credentials
-    }
-
-    private static func fetchLocal(
-        environment: [String: String],
-        homeDirectory: URL,
-        now: Date,
-        allowPrintUsage: Bool
+    /// 额度只从本机官方程序读取（Antigravity App、agy CLI、IDE 扩展），不拿 OAuth 凭据直连 Google 后端：
+    /// Antigravity 附加条款第 6 节禁止第三方软件使用它的 OAuth 访问服务，违者会被封号。
+    static func fetch(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        now: Date = Date()
     ) async throws -> ProviderUsage {
         let processes = (try? localProcesses(homeDirectory: homeDirectory)) ?? []
         var lastError: Error = AntigravityUsageError.localServiceUnavailable
@@ -707,8 +303,7 @@ nonisolated enum AntigravityUsageFetcher {
             }
         }
 
-        if allowPrintUsage,
-           let commandBinary,
+        if let commandBinary,
            let commandVersion,
            commandVersion >= minimumPrintUsageVersion {
             do {
@@ -829,7 +424,6 @@ nonisolated enum AntigravityUsageFetcher {
     private static func makeModelUsage(
         models: [ModelQuota],
         identity: Identity,
-        sourceIsLocal: Bool,
         now: Date
     ) -> ProviderUsage {
         let normalized = models.filter { $0.remainingFraction != nil }.map(normalize)
@@ -857,7 +451,7 @@ nonisolated enum AntigravityUsageFetcher {
                 label: "Claude and \(otherFamilyAbbreviation) models"
             ))
         }
-        if core.isEmpty, sourceIsLocal,
+        if core.isEmpty,
            let fallback = representative(selectable.filter { $0.family == .unknown }) {
             core.append(window(fallback.quota, id: "antigravity-fallback-\(fallback.quota.modelID)", label: displayLabel(fallback.quota)))
         }
@@ -1145,188 +739,6 @@ nonisolated enum AntigravityUsageFetcher {
         return number(value?["value"])
     }
 
-    private static func resolvedProjectID(
-        credentials: inout AntigravityOAuthCredentials,
-        codeAssist: [String: Any],
-        accessToken: String,
-        session: URLSession
-    ) async throws -> String? {
-        if let project = clean(credentials.projectID) { return project }
-        if let project = projectID(codeAssist) {
-            credentials.projectID = project
-            return project
-        }
-        let tiers = codeAssist["allowedTiers"] as? [Any] ?? []
-        let tierID = tiers.compactMap(dictionary).first(where: { bool($0["isDefault"]) == true })
-            .flatMap { clean($0["id"] as? String) }
-            ?? tiers.compactMap(dictionary).compactMap { clean($0["id"] as? String) }.first
-            ?? clean(dictionary(codeAssist["paidTier"])?["id"] as? String)
-            ?? clean(dictionary(codeAssist["currentTier"])?["id"] as? String)
-        guard let tierID else { return nil }
-        do {
-            let onboard = try await requestJSON(
-                path: onboardUserPath,
-                accessToken: accessToken,
-                body: ["tierId": tierID, "metadata": remoteMetadata],
-                session: session
-            )
-            if let project = projectID(onboard) {
-                credentials.projectID = project
-                return project
-            }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            // The service can finish onboarding asynchronously; poll account state below.
-        }
-        for _ in 0..<5 {
-            try await Task.sleep(for: .seconds(2))
-            let refreshed = try await requestJSON(
-                path: loadCodeAssistPath,
-                accessToken: accessToken,
-                body: ["metadata": remoteMetadata],
-                session: session
-            )
-            if let project = projectID(refreshed) {
-                credentials.projectID = project
-                return project
-            }
-        }
-        return nil
-    }
-
-    private static func projectID(_ root: [String: Any]) -> String? {
-        let value = root["cloudaicompanionProject"]
-            ?? dictionary(root["response"])?["cloudaicompanionProject"]
-        return clean(value as? String)
-            ?? clean(dictionary(value)?["id"] as? String)
-            ?? clean(dictionary(value)?["projectId"] as? String)
-    }
-
-    private static func plan(codeAssist: [String: Any], hostedDomain: String?) -> String? {
-        // 明确的付费等级优先；只有 id 没有名称时显示通用的 Paid。
-        if let paid = dictionary(codeAssist["paidTier"]),
-           clean(paid["name"] as? String) != nil || clean(paid["id"] as? String) != nil {
-            return clean(paid["name"] as? String) ?? "Paid"
-        }
-        if let explicit = clean(dictionary(codeAssist["planInfo"])?["planType"] as? String) { return explicit }
-        let tierID = clean(dictionary(codeAssist["currentTier"])?["id"] as? String)
-        switch tierID {
-        case "standard-tier": return "Paid"
-        case "free-tier" where hostedDomain != nil: return "Workspace"
-        case "free-tier": return "Free"
-        case "legacy-tier": return "Legacy"
-        default: return clean(dictionary(codeAssist["currentTier"])?["name"] as? String)
-        }
-    }
-
-    private static func refresh(
-        credentials: AntigravityOAuthCredentials,
-        session: URLSession,
-        now: Date,
-        environment: [String: String]
-    ) async throws -> AntigravityOAuthCredentials {
-        guard let refreshToken = clean(credentials.refreshToken) else { throw AntigravityUsageError.notLoggedIn }
-        let client: (id: String, secret: String)
-        if let id = clean(credentials.clientID), let secret = clean(credentials.clientSecret) {
-            client = (id, secret)
-        } else if let id = clean(environment["ANTIGRAVITY_OAUTH_CLIENT_ID"]),
-                  let secret = clean(environment["ANTIGRAVITY_OAUTH_CLIENT_SECRET"]) {
-            client = (id, secret)
-        } else {
-            throw AntigravityUsageError.notLoggedIn
-        }
-        let parameters = [
-            "client_id": client.id,
-            "client_secret": client.secret,
-            "refresh_token": refreshToken,
-            "grant_type": "refresh_token",
-        ]
-        var request = URLRequest(url: tokenURL)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 10
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-        request.httpBody = parameters.sorted { $0.key < $1.key }.map { key, value in
-            "\(key)=\(value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value)"
-        }.joined(separator: "&").data(using: .utf8)
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw AntigravityUsageError.notLoggedIn
-        }
-        let root = try object(data)
-        guard let accessToken = clean(root["access_token"] as? String) else {
-            throw AntigravityUsageError.unreadableResponse("invalid token refresh response")
-        }
-        var updated = credentials
-        updated.accessToken = accessToken
-        if let seconds = number(root["expires_in"]) {
-            updated.expiryMilliseconds = (now.timeIntervalSince1970 + seconds) * 1_000
-        }
-        if let idToken = clean(root["id_token"] as? String) { updated.idToken = idToken }
-        return updated
-    }
-
-    private static func persist(
-        credentials: AntigravityOAuthCredentials,
-        rawCredential: String,
-        homeDirectory: URL
-    ) throws {
-        guard clean(rawCredential) == nil else { return }
-        let file = homeDirectory.appending(path: ".codexbar/antigravity/oauth_creds.json")
-        guard FileManager.default.fileExists(atPath: file.path) else { return }
-        let data = try JSONEncoder().encode(credentials)
-        try data.write(to: file, options: .atomic)
-    }
-
-    private static func requestJSON(
-        path: String,
-        accessToken: String,
-        body: [String: Any],
-        session: URLSession,
-        timeout: TimeInterval = 10,
-        host: String = baseURL
-    ) async throws -> [String: Any] {
-        var request = try remoteRequest(path: path, accessToken: accessToken, body: body, host: host)
-        request.timeoutInterval = timeout
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw AntigravityUsageError.unreadableResponse("missing HTTP response")
-        }
-        switch http.statusCode {
-        case 200: return try object(data)
-        case 401: throw AntigravityUsageError.notLoggedIn
-        case 403:
-            throw AntigravityUsageError.permissionDenied(
-                clean(String(data: data, encoding: .utf8)) ?? "HTTP 403"
-            )
-        default: throw AntigravityUsageError.requestFailed(http.statusCode)
-        }
-    }
-
-    static func remoteRequest(
-        path: String, accessToken: String, body: [String: Any], host: String = baseURL
-    ) throws -> URLRequest {
-        var request = URLRequest(url: URL(string: host + path)!)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 10
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        #if arch(arm64)
-        let architecture = "arm64"
-        #else
-        let architecture = "amd64"
-        #endif
-        request.setValue("antigravity/hub/2.9.1 darwin/\(architecture)", forHTTPHeaderField: "User-Agent")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        return request
-    }
-
-    private static let remoteMetadata: [String: String] = [
-        "ideType": "ANTIGRAVITY",
-        "platform": "PLATFORM_UNSPECIFIED",
-        "pluginType": "GEMINI",
-    ]
     private static let localMetadataBody: [String: Any] = [
         "metadata": [
             "ideName": "antigravity",
@@ -1747,7 +1159,6 @@ nonisolated enum AntigravityUsageFetcher {
         stubDirectory: URL?
     ) -> [String: String] {
         var result = environment
-        result.removeValue(forKey: credentialsEnvironmentKey)
         // agy 只认 "true"，不认 "1"。
         result["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
         let basePath = clean(environment["PATH"])

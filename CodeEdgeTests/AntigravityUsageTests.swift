@@ -252,183 +252,6 @@ struct AntigravityUsageTests {
     }
 
     @Test
-    func fullAvailableModelFractionsRequireQuotaVerification() {
-        let full = [
-            AntigravityUsageFetcher.ModelQuota(
-                label: "Gemini Pro", modelID: "gemini-pro", remainingFraction: 1,
-                resetsAt: nil, resetDescription: nil
-            ),
-        ]
-        let partial = [
-            AntigravityUsageFetcher.ModelQuota(
-                label: "Gemini Pro", modelID: "gemini-pro", remainingFraction: 0.9,
-                resetsAt: nil, resetDescription: nil
-            ),
-        ]
-
-        #expect(AntigravityUsageFetcher.shouldVerifyAvailableModels(full))
-        #expect(!AntigravityUsageFetcher.shouldVerifyAvailableModels(partial))
-    }
-
-    @Test
-    func verifiedBucketsReplaceAvailabilityFractionsAndDropUnverifiedRows() {
-        let models = [
-            AntigravityUsageFetcher.ModelQuota(
-                label: "Gemini Pro", modelID: "gemini-pro", remainingFraction: 1,
-                resetsAt: nil, resetDescription: nil
-            ),
-            AntigravityUsageFetcher.ModelQuota(
-                label: "Gemini Flash", modelID: "gemini-flash", remainingFraction: 1,
-                resetsAt: nil, resetDescription: nil
-            ),
-        ]
-        let verified = [
-            AntigravityUsageFetcher.ModelQuota(
-                label: "gemini-pro", modelID: "gemini-pro", remainingFraction: 0.25,
-                resetsAt: Date(timeIntervalSince1970: 123), resetDescription: nil
-            ),
-        ]
-
-        let merged = AntigravityUsageFetcher.merge(models: models, verified: verified)
-
-        #expect(merged.count == 1)
-        #expect(merged.first?.label == "Gemini Pro")
-        #expect(merged.first?.remainingFraction == 0.25)
-        #expect(merged.first?.resetsAt == Date(timeIntervalSince1970: 123))
-    }
-
-    @Test
-    func credentialsAcceptSnakeAndCamelShapesAndClaimsPreferSignedEmail() throws {
-        let expiry = 1_800_000_000_000.0
-        let snake = try JSONDecoder().decode(
-            AntigravityOAuthCredentials.self,
-            from: Data("""
-            {"access_token":"a","refresh_token":"r","expiry_date":\(expiry),"project_id":"p"}
-            """.utf8)
-        )
-        let camel = try JSONDecoder().decode(
-            AntigravityOAuthCredentials.self,
-            from: Data("""
-            {"accessToken":"a","refreshToken":"r","expiresAt":1800000000000,"projectId":"p"}
-            """.utf8)
-        )
-        let payload = try JSONSerialization.data(withJSONObject: ["email": "signed@example.com", "hd": "example.com"])
-            .base64EncodedString().replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-        let claims = AntigravityUsageFetcher.tokenClaims("header.\(payload).signature")
-
-        #expect(snake.accessToken == camel.accessToken)
-        #expect(snake.expiryMilliseconds == camel.expiryMilliseconds)
-        #expect(snake.projectID == camel.projectID)
-        #expect(claims.email == "signed@example.com")
-        #expect(claims.hostedDomain == "example.com")
-    }
-
-    @Test
-    func remoteFetchUsesExactEndpointsHeadersAndProject() async throws {
-        let protocolStub = AntigravityTestURLProtocol.self
-        protocolStub.requests = []
-        protocolStub.handler = { request in
-            guard let url = request.url else { throw URLError(.badURL) }
-            if url.path == "/v1internal:loadCodeAssist" {
-                return response(url, """
-                {"currentTier":{"id":"standard-tier"},"cloudaicompanionProject":"project-123"}
-                """)
-            }
-            if url.path == "/v1internal:fetchAvailableModels" {
-                return response(url, """
-                {"models":{"gemini-3-pro":{"displayName":"Gemini 3 Pro","quotaInfo":{"remainingFraction":0.4}}}}
-                """)
-            }
-            return response(url, "{}", status: 404)
-        }
-        defer { protocolStub.handler = nil; protocolStub.requests = [] }
-
-        let credentials = AntigravityOAuthCredentials(
-            accessToken: "token", refreshToken: nil, expiryDate: Date().addingTimeInterval(3600),
-            idToken: try idToken(email: "person@example.com")
-        )
-        let credentialData = try JSONEncoder().encode(credentials)
-        let credential = try #require(String(data: credentialData, encoding: .utf8))
-        let session = stubSession(protocolStub)
-
-        let usage = try await AntigravityUsageFetcher.fetchRemote(
-            credential: credential,
-            session: session,
-            environment: [:],
-            homeDirectory: FileManager.default.temporaryDirectory
-        )
-
-        #expect(usage.windows.first?.usedFraction == 0.6)
-        #expect(usage.plan == "Paid")
-        #expect(usage.details.isEmpty)
-        // 额度汇总走 daily 主机，失败后回退到稳定主机的模型列表。
-        #expect(protocolStub.requests.map { "\($0.url?.host ?? "")\($0.url?.path ?? "")" } == [
-            "cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-            "daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-            "cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-        ])
-        #if arch(arm64)
-        let expectedUserAgent = "antigravity/hub/2.9.1 darwin/arm64"
-        #else
-        let expectedUserAgent = "antigravity/hub/2.9.1 darwin/amd64"
-        #endif
-        #expect(protocolStub.requests.allSatisfy {
-            $0.value(forHTTPHeaderField: "Authorization") == "Bearer token"
-                && $0.value(forHTTPHeaderField: "User-Agent") == expectedUserAgent
-        })
-        let request = try AntigravityUsageFetcher.remoteRequest(
-            path: "/v1internal:fetchAvailableModels",
-            accessToken: "token",
-            body: ["project": "project-123"]
-        )
-        let body = try #require(request.httpBody)
-        let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
-        #expect(json["project"] as? String == "project-123")
-    }
-
-    @Test
-    func remoteFullFractionsAreReplacedByVerifiedQuotaBuckets() async throws {
-        let protocolStub = AntigravityTestURLProtocol.self
-        protocolStub.requests = []
-        protocolStub.handler = { request in
-            guard let url = request.url else { throw URLError(.badURL) }
-            switch url.path {
-            case "/v1internal:loadCodeAssist":
-                return response(url, "{\"cloudaicompanionProject\":\"project-123\"}")
-            case "/v1internal:fetchAvailableModels":
-                return response(url, """
-                {"models":{"gemini-3-pro":{"displayName":"Gemini 3 Pro","quotaInfo":{"remainingFraction":1}}}}
-                """)
-            case "/v1internal:retrieveUserQuota":
-                return response(url, """
-                {"buckets":[{"modelId":"gemini-3-pro","remainingFraction":0.2}]}
-                """)
-            default:
-                return response(url, "{}", status: 404)
-            }
-        }
-        defer { protocolStub.handler = nil; protocolStub.requests = [] }
-
-        let credentials = AntigravityOAuthCredentials(
-            accessToken: "token", refreshToken: nil, expiryDate: Date().addingTimeInterval(3600)
-        )
-        let data = try JSONEncoder().encode(credentials)
-        let credential = try #require(String(data: data, encoding: .utf8))
-
-        let usage = try await AntigravityUsageFetcher.fetchRemote(
-            credential: credential,
-            session: stubSession(protocolStub),
-            environment: [:],
-            homeDirectory: FileManager.default.temporaryDirectory
-        )
-
-        #expect(usage.windows.first?.usedFraction == 0.8)
-        let paths = protocolStub.requests.compactMap { $0.url?.path }
-        #expect(paths.contains("/v1internal:retrieveUserQuota"))
-    }
-
-    @Test
     func ordinaryGeminiBucketRepresentsGeminiOverModelSpecificAllowance() throws {
         let data = Data("""
         {"groups":[{"displayName":"Gemini Models","buckets":[
@@ -441,46 +264,6 @@ struct AntigravityUsageTests {
 
         #expect(usage.windows.first?.usedFraction == 0.25)
         #expect(usage.additionalWindows.count == 2)
-    }
-
-    @Test(arguments: [
-        (#"{"cloudaicompanionProject":"p","paidTier":{"id":"g1-ultra-tier","name":"Google AI Ultra"},"currentTier":{"id":"free-tier"}}"#, "Google AI Ultra"),
-        (#"{"cloudaicompanionProject":"p","paidTier":{"id":"g1-pro-tier"},"currentTier":{"id":"free-tier"}}"#, "Paid"),
-        (#"{"cloudaicompanionProject":"p","currentTier":{"id":"free-tier"}}"#, nil),
-    ] as [(String, String?)])
-    func remotePlanUsesPaidTierAndDropsContradictedFree(codeAssist: String, expectedPlan: String?) async throws {
-        let protocolStub = AntigravityTestURLProtocol.self
-        protocolStub.requests = []
-        protocolStub.handler = { request in
-            guard let url = request.url else { throw URLError(.badURL) }
-            switch url.path {
-            case "/v1internal:loadCodeAssist":
-                return response(url, codeAssist)
-            case "/v1internal:retrieveUserQuotaSummary":
-                return response(url, """
-                {"groups":[{"displayName":"Gemini Models","buckets":[
-                  {"bucketId":"gemini-5h","displayName":"Five Hour Limit","remainingFraction":0.5}
-                ]}]}
-                """)
-            default:
-                return response(url, "{}", status: 404)
-            }
-        }
-        defer { protocolStub.handler = nil; protocolStub.requests = [] }
-        let credentials = AntigravityOAuthCredentials(
-            accessToken: "token", refreshToken: nil, expiryDate: Date().addingTimeInterval(3600)
-        )
-        let credential = try #require(String(data: try JSONEncoder().encode(credentials), encoding: .utf8))
-
-        let usage = try await AntigravityUsageFetcher.fetchRemote(
-            credential: credential,
-            session: stubSession(protocolStub),
-            environment: [:],
-            homeDirectory: FileManager.default.temporaryDirectory
-        )
-
-        // Free 账号不会有 5 小时额度，两者矛盾时不显示套餐名。
-        #expect(usage.plan == expectedPlan)
     }
 
     @Test
@@ -707,7 +490,7 @@ struct AntigravityUsageTests {
           echo "1.5.17"
           exit 0
         fi
-        if [ "$AGY_CLI_DISABLE_AUTO_UPDATE" != "true" ] || [ -n "$ANTIGRAVITY_OAUTH_CREDENTIALS_JSON" ]; then
+        if [ "$AGY_CLI_DISABLE_AUTO_UPDATE" != "true" ]; then
           exit 2
         fi
         cat <<'JSON'
@@ -718,50 +501,10 @@ struct AntigravityUsageTests {
 
         let usage = try await AntigravityUsageFetcher.fetchPrintUsage(
             binary: script.path,
-            environment: ["ANTIGRAVITY_OAUTH_CREDENTIALS_JSON": "{\"access_token\":\"secret\"}"]
+            environment: [:]
         )
 
         #expect(usage.additionalWindows.map(\.id) == ["antigravity-quota-summary-gemini-5h"])
         #expect(abs((usage.additionalWindows.first?.usedFraction ?? 0) - 0.4) < 0.0001)
     }
-
-    private func stubSession(_ protocolClass: AnyClass) -> URLSession {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [protocolClass]
-        return URLSession(configuration: configuration)
-    }
-
-    private func response(_ url: URL, _ body: String, status: Int = 200) -> (HTTPURLResponse, Data) {
-        (HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil)!, Data(body.utf8))
-    }
-
-    private func idToken(email: String) throws -> String {
-        let payload = try JSONSerialization.data(withJSONObject: ["email": email])
-            .base64EncodedString().replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-        return "header.\(payload).signature"
-    }
-}
-
-private final class AntigravityTestURLProtocol: URLProtocol {
-    nonisolated(unsafe) static var requests: [URLRequest] = []
-    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
-
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-    override func startLoading() {
-        Self.requests.append(request)
-        do {
-            guard let handler = Self.handler else { throw URLError(.badServerResponse) }
-            let (response, data) = try handler(request)
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: data)
-            client?.urlProtocolDidFinishLoading(self)
-        } catch {
-            client?.urlProtocol(self, didFailWithError: error)
-        }
-    }
-
-    override func stopLoading() {}
 }

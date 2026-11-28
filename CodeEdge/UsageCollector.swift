@@ -494,11 +494,7 @@ actor UsageCollector: UsageCollecting {
             return try await GeminiUsageFetcher.fetch(session: session)
         }
         if descriptor.id.rawValue == "antigravity" {
-            return try await AntigravityUsageFetcher.fetch(
-                credential: resolvedSecret,
-                source: configuration.source,
-                session: session
-            )
+            return try await AntigravityUsageFetcher.fetch()
         }
         if descriptor.id.rawValue == "fireworks" {
             guard let apiKey = FireworksUsageFetcher.resolvedAPIKey(configured: resolvedSecret) else {
